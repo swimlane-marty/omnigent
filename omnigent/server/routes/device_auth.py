@@ -795,7 +795,7 @@ def create_device_auth_router(
             query += "&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
-    def _session_iat(request: Request) -> int | None:
+    def _session_login_time(request: Request) -> int | None:
         """Return the last-login time of the caller's session JWT.
 
         Read from the session cookie: its ``auth_time`` (the interactive
@@ -826,7 +826,7 @@ def create_device_auth_router(
         so any mismatch is visible before approval.
 
         **Re-authentication:** consent requires a login performed AFTER this
-        device flow began (session ``iat`` ≥ the grant's ``created_at``). A
+        device flow began (session login time ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
         costs a deliberate, fresh password entry. This closes the
@@ -854,11 +854,11 @@ def create_device_auth_router(
             )
 
         # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (iat ≥ the grant's created_at)
+        # only a login started for THIS flow (login time ≥ the grant's created_at)
         # may approve. Bounce with reauth=1 so the login page re-prompts
         # rather than auto-returning the stale session (which would loop).
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        session_login_time = _session_login_time(request)
+        if session_login_time is None or session_login_time < grant.created_at:
             return _bounce_to_login(request, user_code, reauth=True)
 
         return HTMLResponse(
@@ -896,9 +896,9 @@ def create_device_auth_router(
 
         # Re-auth gate, enforced here too (not just on the consent GET): a
         # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session iat ≥ the grant's created_at) passes.
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # started for THIS flow (session login time ≥ the grant's created_at) passes.
+        session_login_time = _session_login_time(request)
+        if session_login_time is None or session_login_time < grant.created_at:
             return HTMLResponse(
                 _consent_html(
                     error="Your session is too old to approve this login. "
