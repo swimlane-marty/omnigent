@@ -420,6 +420,27 @@ overrides this auto-selection.
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
 
+### Browser sessions
+
+In `accounts` and `oidc` modes the web UI (and the mobile / desktop apps that
+wrap it) stays signed in while it is in use. The session cookie has an idle
+window, and a request made after half of it has passed gets a fresh cookie for
+another full window. Only a new login resets the absolute limit, so a browser
+signs in again at most once per max lifetime.
+
+| Variable (accounts / OIDC) | Default | Meaning |
+|---|---|---|
+| `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle window: an unused session expires after this long. |
+| `OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` / `OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS` | `720` (30 days) | Absolute limit from login. Must be at least the idle window. Set it equal to the idle window to turn renewal off. |
+
+Signing out ends the session and every renewed cookie descended from it.
+Cookies issued before an upgrade to this behavior are not renewed. They expire
+on schedule, and the next login issues one that renews. CLI and host tokens
+(`omnigent login`) renew through their refresh grants instead. In OIDC mode the
+IdP is only consulted at login, so the max lifetime is also how long an active
+browser keeps access after a user is removed at the IdP. Lower it to match your
+deprovisioning policy.
+
 ### Browser origin allowlist
 
 Independent of the auth mode above, the server also checks the browser

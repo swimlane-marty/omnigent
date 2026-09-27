@@ -3995,6 +3995,14 @@ def create_app(
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
+    if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+        "accounts",
+        "oidc",
+    ):
+        from omnigent.server.auth import SessionRenewalMiddleware
+
+        # Slide the browser session cookie forward for active users.
+        app.add_middleware(SessionRenewalMiddleware, auth_provider=auth_provider)
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before

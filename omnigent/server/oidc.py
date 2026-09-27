@@ -17,9 +17,13 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 import jwt
+
+if TYPE_CHECKING:
+    from starlette.responses import Response
 
 _logger = logging.getLogger(__name__)
 
@@ -57,6 +61,8 @@ def mint_session_token(
     provider: str,
     *,
     account_generation: str | None = None,
+    auth_time: int | None = None,
+    session_id: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -73,10 +79,17 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param auth_time: Epoch second of the interactive login this token
+        descends from, e.g. ``1767225600``. Present only on browser
+        session tokens; bounds sliding renewal by the absolute session
+        lifetime.
+    :param session_id: Opaque browser-session id (the ``sid`` claim),
+        carried unchanged across renewals so logout can end the whole
+        chain.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
-    payload = {
+    payload: dict[str, str | int] = {
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,
@@ -84,6 +97,10 @@ def mint_session_token(
     }
     if account_generation is not None:
         payload["account_generation"] = account_generation
+    if auth_time is not None:
+        payload["auth_time"] = auth_time
+    if session_id is not None:
+        payload["sid"] = session_id
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -95,7 +112,12 @@ def mint_session_cookie(
     *,
     account_generation: str | None = None,
 ) -> str:
-    """Mint a signed session cookie JWT.
+    """Mint a signed session cookie JWT for a fresh interactive login.
+
+    Stamps ``auth_time`` (now) and a new random ``sid`` so the browser
+    session can later slide forward (see
+    :meth:`UnifiedAuthProvider.renew_browser_session`) without ever
+    outliving its absolute lifetime, and so logout can end it.
 
     :param user_id: The authenticated user's email, e.g.
         ``"alice@example.com"``.
@@ -106,8 +128,89 @@ def mint_session_cookie(
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
-        user_id, cookie_secret, ttl_hours * 3600, provider, account_generation=account_generation
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        auth_time=int(time.time()),
+        session_id=secrets.token_urlsafe(16),
     )
+
+
+def set_session_cookie(
+    response: Response,
+    token: str,
+    *,
+    cookie_name: str,
+    secure: bool,
+    max_age_seconds: int,
+) -> None:
+    """Attach the session JWT cookie to *response*.
+
+    The single source of the session cookie's attributes, shared by
+    every login route (accounts and OIDC) and by sliding renewal, so a
+    renewed cookie can never drift from the one login set.
+
+    :param response: The outgoing response.
+    :param token: The session JWT.
+    :param cookie_name: ``__Host-ap_session`` on HTTPS, ``ap_session``
+        on plain HTTP (see ``session_cookie_name`` on either config).
+    :param secure: Whether to set the ``Secure`` attribute.
+    :param max_age_seconds: Cookie lifetime, matching the JWT's ``exp``.
+    """
+    # samesite="lax" is the right CSRF-safe default for a standalone deploy
+    # (top-level navigation to the app's own domain). It does NOT work when the
+    # app is embedded in a cross-origin iframe — e.g. Hugging Face Spaces' preview
+    # pane — because browsers won't send a Lax cookie in a third-party frame, so
+    # login appears to loop. The validated workaround is to open the app at its
+    # direct URL (top-level tab). To support the embedded case, this would need a
+    # "samesite=none; Secure" option gated behind an opt-in env var — deferred, as
+    # it widens CSRF exposure and the direct-URL path already works.
+    response.set_cookie(
+        key=cookie_name,
+        value=token,
+        max_age=max_age_seconds,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+# Default absolute browser-session lifetime (30 days): the usual "keep me
+# signed in" horizon. Only a fresh login resets it; an unused cookie still
+# dies after the idle window. Rationale in ``accounts_config``'s docstring.
+DEFAULT_SESSION_MAX_LIFETIME_HOURS = 720
+
+
+def parse_session_max_lifetime_hours(env_var: str, session_ttl_hours: int) -> int:
+    """Read an absolute browser-session lifetime (hours) from *env_var*.
+
+    Unset or empty resolves to :data:`DEFAULT_SESSION_MAX_LIFETIME_HOURS`,
+    raised to *session_ttl_hours* when the idle window is already longer
+    (so upgrading never shortens an existing configuration). An explicit
+    value below the idle window is a contradiction and fails loud.
+
+    :param env_var: e.g. ``"OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS"``.
+    :param session_ttl_hours: The configured idle window, e.g. ``8``.
+    :returns: The absolute lifetime in hours.
+    :raises RuntimeError: When the value is not an integer or is shorter
+        than *session_ttl_hours*.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return max(DEFAULT_SESSION_MAX_LIFETIME_HOURS, session_ttl_hours)
+    try:
+        hours = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{env_var} must be an integer number of hours; got {raw!r}") from exc
+    if hours < session_ttl_hours:
+        raise RuntimeError(
+            f"{env_var}={hours} is shorter than the session idle window "
+            f"({session_ttl_hours}h); set it to at least that value"
+        )
+    return hours
 
 
 def hmac_digest(token: str, secret: bytes) -> str:
@@ -152,7 +255,9 @@ class OIDCConfig:
         (at least 32 bytes).
     :param scopes: Space-separated OAuth scopes, e.g.
         ``"openid email profile"``.
-    :param session_ttl_hours: Session cookie lifetime in hours.
+    :param session_ttl_hours: Session cookie idle window in hours. A
+        browser session used past half of it is renewed for another
+        full window (see ``session_max_lifetime_hours``).
     :param logout_redirect_uri: Optional IdP end-session endpoint
         URL. ``None`` means logout just clears the cookie.
     :param allowed_domains: Optional frozenset of allowed email
@@ -175,6 +280,13 @@ class OIDCConfig:
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
         ``"email"``. Only affects the generic-OIDC path.
+    :param session_max_lifetime_hours: Absolute browser-session
+        lifetime in hours, from ``OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS``
+        (default :data:`DEFAULT_SESSION_MAX_LIFETIME_HOURS`). Sliding
+        renewal never extends a session past its IdP login plus this.
+        The IdP is only consulted at login, so this is also the longest an
+        active browser keeps access after the user is deprovisioned at
+        the IdP; set it equal to ``session_ttl_hours`` to disable renewal.
     """
 
     issuer: str
@@ -194,6 +306,12 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    session_max_lifetime_hours: int = DEFAULT_SESSION_MAX_LIFETIME_HOURS
+
+    @property
+    def session_max_lifetime_seconds(self) -> int:
+        """Absolute browser-session lifetime, never below the idle window."""
+        return max(self.session_max_lifetime_hours, self.session_ttl_hours) * 3600
 
     @property
     def base_url(self) -> str:
@@ -286,6 +404,9 @@ class OIDCConfig:
             )
 
         session_ttl_hours = int(os.environ.get("OMNIGENT_OIDC_SESSION_TTL_HOURS", "8"))
+        session_max_lifetime_hours = parse_session_max_lifetime_hours(
+            "OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS", session_ttl_hours
+        )
         logout_redirect_uri = (
             os.environ.get("OMNIGENT_OIDC_LOGOUT_REDIRECT_URI", "").strip() or None
         )
@@ -361,6 +482,7 @@ class OIDCConfig:
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
+                session_max_lifetime_hours=session_max_lifetime_hours,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -404,4 +526,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            session_max_lifetime_hours=session_max_lifetime_hours,
         )

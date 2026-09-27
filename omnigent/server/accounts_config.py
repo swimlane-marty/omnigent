@@ -23,8 +23,24 @@ Env vars (all start with ``OMNIGENT_ACCOUNTS_``):
 - ``COOKIE_SECRET`` — required, 64+ hex chars. HMAC key for HS256
   session cookies. Generate with ``openssl rand -hex 32`` (or
   ``deploy/docker/bootstrap.sh`` mints one alongside POSTGRES_PASSWORD).
-- ``SESSION_TTL_HOURS`` — optional, default 8. How long a
-  ``/auth/login`` cookie stays valid.
+- ``SESSION_TTL_HOURS`` — optional, default 8. The browser session's
+  idle window: how long a session cookie stays valid without use. A
+  cookie-authenticated request made after half of it has elapsed gets a
+  fresh cookie for another full window (sliding renewal), so an active
+  user is not signed out mid-use.
+- ``SESSION_MAX_LIFETIME_HOURS`` — optional, default 720 (30 days, or
+  ``SESSION_TTL_HOURS`` if that is longer). The absolute limit on a
+  browser session: renewal never extends it past the original login
+  plus this, after which the user signs in again. 30 days matches the
+  usual "keep me signed in" horizon — a daily user re-enters their
+  password about once a month, while an idle cookie still dies after
+  ``SESSION_TTL_HOURS``. Must be at least ``SESSION_TTL_HOURS``; set it
+  equal to disable renewal. Session cookies minted before renewal
+  existed carry no ``auth_time`` claim and are never renewed — they
+  lapse at their original expiry and the next login mints a renewable
+  one. Only the session cookie slides; ``Authorization: Bearer`` tokens
+  and delegated tokens (``grant_id`` / ``scope``) keep their fixed
+  expiry and renew through their refresh grants instead.
 - ``BASE_URL`` — required. The user-facing base URL of the
   deployment, e.g. ``"https://omnigent.example.com"`` or
   ``"http://localhost:6767"``. Determines whether session cookies
@@ -49,6 +65,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from omnigent.server.oidc import (
+    DEFAULT_SESSION_MAX_LIFETIME_HOURS,
+    parse_session_max_lifetime_hours,
+)
+
 
 @dataclass(frozen=True)
 class AccountsConfig:
@@ -56,8 +77,8 @@ class AccountsConfig:
 
     :param cookie_secret: HMAC-SHA256 key bytes for HS256 session
         cookies. Decoded from hex; minimum 32 bytes (64 hex chars).
-    :param session_ttl_hours: How many hours a login cookie is
-        valid.
+    :param session_ttl_hours: The session cookie's idle window in
+        hours; renewed for another window once half has elapsed.
     :param base_url: Public base URL of the deployment. Drives
         the ``Secure`` cookie attribute and the ``__Host-`` prefix.
     :param init_admin_password: Optional pre-seeded password for
@@ -68,6 +89,9 @@ class AccountsConfig:
         are redeemable for.
     :param magic_ttl_seconds: How long ``/auth/magic`` tokens
         are redeemable for. Short by design.
+    :param session_max_lifetime_hours: Absolute browser-session
+        lifetime in hours. Sliding renewal never extends a session
+        past its login plus this.
     """
 
     cookie_secret: bytes
@@ -76,6 +100,12 @@ class AccountsConfig:
     init_admin_password: str | None
     invite_ttl_seconds: int
     magic_ttl_seconds: int
+    session_max_lifetime_hours: int = DEFAULT_SESSION_MAX_LIFETIME_HOURS
+
+    @property
+    def session_max_lifetime_seconds(self) -> int:
+        """Absolute browser-session lifetime, never below the idle window."""
+        return max(self.session_max_lifetime_hours, self.session_ttl_hours) * 3600
 
     @property
     def secure_cookies(self) -> bool:
@@ -136,6 +166,9 @@ class AccountsConfig:
             )
 
         session_ttl_hours = int(os.environ.get("OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS", "8"))
+        session_max_lifetime_hours = parse_session_max_lifetime_hours(
+            "OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS", session_ttl_hours
+        )
         invite_ttl_seconds = int(os.environ.get("OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS", "72")) * 3600
         magic_ttl_seconds = int(os.environ.get("OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES", "10")) * 60
 
@@ -151,4 +184,5 @@ class AccountsConfig:
             init_admin_password=init_admin,
             invite_ttl_seconds=invite_ttl_seconds,
             magic_ttl_seconds=magic_ttl_seconds,
+            session_max_lifetime_hours=session_max_lifetime_hours,
         )

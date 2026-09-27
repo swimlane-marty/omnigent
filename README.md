@@ -510,6 +510,12 @@ and they're in. Signup is invite-only.
 > reachable on your network; for anyone off it, deploy an always-on host
 > (see [step 4](#4-deploy-a-server-and-use-it-from-your-phone)).
 
+Browsers stay signed in while they're in use. A session left idle expires
+after 8 hours (`OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS`), and every session ends
+30 days after login (`OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS`). OIDC
+mode uses the matching `OMNIGENT_OIDC_SESSION_*` variables. See
+[`deploy/README.md#browser-sessions`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#browser-sessions).
+
 #### Code together
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;

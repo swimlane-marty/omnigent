@@ -39,7 +39,7 @@ from omnigent.db.account_authority import bind_account_authority, target_account
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
-from omnigent.server.oidc import mint_session_cookie
+from omnigent.server.oidc import mint_session_cookie, set_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
     hash_password,
@@ -152,23 +152,15 @@ def _set_session_cookie(
     Centralized so every cookie-setting site (login, register,
     magic redeem) uses the same attributes — divergence here is
     a recipe for "works in one route but not another" auth bugs.
+    Delegates to :func:`omnigent.server.oidc.set_session_cookie`,
+    which sliding renewal also uses.
     """
-    # samesite="lax" is the right CSRF-safe default for a standalone deploy
-    # (top-level navigation to the app's own domain). It does NOT work when the
-    # app is embedded in a cross-origin iframe — e.g. Hugging Face Spaces' preview
-    # pane — because browsers won't send a Lax cookie in a third-party frame, so
-    # login appears to loop. The validated workaround is to open the app at its
-    # direct URL (top-level tab). To support the embedded case, this would need a
-    # "samesite=none; Secure" option gated behind an opt-in env var — deferred, as
-    # it widens CSRF exposure and the direct-URL path already works.
-    response.set_cookie(
-        key=cookie_name,
-        value=token,
-        max_age=max_age_seconds,
-        httponly=True,
+    set_session_cookie(
+        response,
+        token,
+        cookie_name=cookie_name,
         secure=secure,
-        samesite="lax",
-        path="/",
+        max_age_seconds=max_age_seconds,
     )
 
 
@@ -370,8 +362,9 @@ def create_accounts_auth_router(
         return resp
 
     @router.post("/logout")
-    async def logout() -> Response:
-        """Clear the session cookie. Always 204 (no body)."""
+    async def logout(request: Request) -> Response:
+        """End the browser session and clear its cookie. Always 204 (no body)."""
+        auth_provider.end_browser_session(request)
         resp = Response(status_code=204)
         _clear_session_cookie(resp, cookie_name=_session_cookie, secure=_secure)
         return resp

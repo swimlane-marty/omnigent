@@ -36,6 +36,7 @@ from omnigent.server.oidc import (
     derive_code_challenge,
     generate_code_verifier,
     mint_session_cookie,
+    set_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes.device_auth import issue_login_grant
@@ -465,14 +466,12 @@ def create_auth_router(
             resp = HTMLResponse(content=html)
             # Still set the session cookie (useful if they also open
             # the web UI in the same browser).
-            resp.set_cookie(
-                key=_session_cookie,
-                value=session_jwt,
-                max_age=config.session_ttl_hours * 3600,
-                httponly=True,
+            set_session_cookie(
+                resp,
+                session_jwt,
+                cookie_name=_session_cookie,
                 secure=_secure,
-                samesite="lax",
-                path="/",
+                max_age_seconds=config.session_ttl_hours * 3600,
             )
             resp.delete_cookie(
                 key=_state_cookie,
@@ -485,14 +484,12 @@ def create_auth_router(
 
         # Normal browser login — redirect back to the app.
         response = RedirectResponse(url=return_to, status_code=302)
-        response.set_cookie(
-            key=_session_cookie,
-            value=session_jwt,
-            max_age=config.session_ttl_hours * 3600,
-            httponly=True,
+        set_session_cookie(
+            response,
+            session_jwt,
+            cookie_name=_session_cookie,
             secure=_secure,
-            samesite="lax",
-            path="/",
+            max_age_seconds=config.session_ttl_hours * 3600,
         )
         # Clear the auth state cookie.
         response.delete_cookie(
@@ -566,6 +563,7 @@ def create_auth_router(
 
         :returns: 302 redirect with the session cookie cleared.
         """
+        auth_provider.end_browser_session(request)
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)

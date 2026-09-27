@@ -796,11 +796,13 @@ def create_device_auth_router(
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
     def _session_iat(request: Request) -> int | None:
-        """Return the ``iat`` (issue time) of the caller's session JWT.
+        """Return the last-login time of the caller's session JWT.
 
-        Read from the session cookie (accounts mode mints a fresh ``iat``
-        on every ``/auth/login``, so this is effectively the last-login
-        time). ``None`` when absent/invalid. Used to enforce that consent
+        Read from the session cookie: its ``auth_time`` (the interactive
+        login, preserved across sliding renewal), falling back to ``iat``
+        for legacy cookies minted before ``auth_time`` existed. A renewed
+        cookie's ``iat`` is recent without any fresh login, so it must not
+        count. ``None`` when absent/invalid. Used to enforce that consent
         follows a login started FOR this device flow.
         """
         token = request.cookies.get(session_cookie_name)
@@ -810,8 +812,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        login_time = payload.get("auth_time", payload.get("iat"))
+        return login_time if isinstance(login_time, int) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
