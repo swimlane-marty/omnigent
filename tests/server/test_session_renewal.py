@@ -36,6 +36,7 @@ from omnigent.server.auth import (
     SessionRenewalMiddleware,
     UnifiedAuthProvider,
 )
+from omnigent.server.browser_session_store import BrowserSessionRevocationStore
 from omnigent.server.oidc import OIDCConfig, hmac_digest, mint_session_cookie
 from tests.server.test_accounts import _build_accounts_app, _login
 
@@ -558,6 +559,9 @@ def test_accounts_logout_ends_renewed_session(
             after = client.get("/auth/me", headers=_cookie(name, token))
             assert after.status_code == 401
             assert _session_set_cookies(after, name) == []
+        # Recorded durably, where other replicas and restarts will see it.
+        durable = BrowserSessionRevocationStore(f"sqlite:///{tmp_path}/test.db")
+        assert durable.is_revoked(login_claims["sid"])
 
 
 @pytest.mark.parametrize("origin", [_HTTP, _HTTPS])
@@ -838,3 +842,172 @@ def test_create_app_renews_oidc_session_cookie(
         assert resp.status_code == 200, resp.text
         assert resp.json()["user_id"] == _USER
         assert _decode(_renewed_token(resp, name))["sid"] == "sid-abc"
+
+
+# ── Review round 1 regressions ───────────────────────────────────
+
+
+class _Clock:
+    """Replace ``time.time`` with a controllable wall clock.
+
+    Starts at the real time; ``tick`` seconds are added after every read,
+    so ``tick=1`` models a clock that crosses a second boundary between
+    any two reads.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, tick: int = 0) -> None:
+        self.now = float(int(time.time()))
+        self.tick = tick
+        monkeypatch.setattr(time, "time", self)
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.tick
+        return value
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_request_outliving_its_token_is_not_renewed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token valid at authentication but expired by response start is not renewed."""
+    provider = _provider("oidc", _HTTP)
+    clock = _Clock(monkeypatch)
+    app = FastAPI()
+
+    @app.get(_PROBE)
+    def slow(request: Request) -> Response:
+        assert provider.get_user_id(request) == _USER
+        clock.advance(30)  # the token expires while the handler runs
+        return JSONResponse(content={"ok": True})
+
+    app.add_middleware(SessionRenewalMiddleware, auth_provider=provider)
+    with TestClient(app) as client:
+        resp = client.get(_PROBE, headers=_cookie("ap_session", _session_jwt(remaining=10)))
+
+    assert resp.status_code == 200
+    assert _session_set_cookies(resp, "ap_session") == []
+
+
+def test_logout_with_expired_cookie_still_ends_the_session(db_uri: str) -> None:
+    """Logout records the sid even when its cookie has just expired.
+
+    A request that authenticated just before expiry may still be renewing
+    the session; that renewal must find the session ended.
+    """
+    store = BrowserSessionRevocationStore(db_uri)
+    provider = _provider("oidc", _HTTP)
+    provider.set_session_revocation_store(store)
+    expired = _session_jwt(remaining=-30)
+
+    provider.end_browser_session(_Conn(cookies={"ap_session": expired}))  # type: ignore[arg-type]
+
+    assert store.is_revoked("sid-abc")
+    assert "sid-abc" in provider._ended_sessions
+    assert provider.renew_browser_session(_decode(_session_jwt(remaining=600))) is None
+
+
+def test_logout_ignores_a_forged_expired_cookie(db_uri: str) -> None:
+    """Skipping exp verification at logout still verifies the signature."""
+    store = BrowserSessionRevocationStore(db_uri)
+    provider = _provider("oidc", _HTTP)
+    provider.set_session_revocation_store(store)
+    forged = _session_jwt(remaining=-30, secret=b"x" * 32)
+
+    provider.end_browser_session(_Conn(cookies={"ap_session": forged}))  # type: ignore[arg-type]
+
+    assert not store.is_revoked("sid-abc")
+    assert provider._ended_sessions == {}
+
+
+def test_cache_hit_past_wall_clock_exp_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cached token is rejected once wall time passes its exp.
+
+    The cache deadline is monotonic, so a wall-clock jump can leave it in
+    the future after the JWT has expired.
+    """
+    provider = _provider("oidc", _HTTP)
+    clock = _Clock(monkeypatch)
+    token = _session_jwt(remaining=30)
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
+    key = hmac_digest(token, _SECRET)
+
+    clock.advance(45)
+    late = _Conn(cookies={"ap_session": token})
+
+    assert provider._cookie_cache[key][1] > time.monotonic()
+    assert provider.get_user_id(late) is None  # type: ignore[arg-type]
+    assert _SESSION_RENEWAL_KEY not in late.scope
+    assert key not in provider._cookie_cache
+
+
+def test_capped_renewal_exp_is_exact_when_the_clock_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Renewal reads the clock once, so a capped exp never overshoots by a second."""
+    provider = _provider("accounts", _HTTP, max_hours=10)
+    payload = _decode(_session_jwt(remaining=1800, logged_in_ago=int(8.5 * 3600)))
+    _Clock(monkeypatch, tick=1)  # every read crosses a second boundary
+
+    renewed = provider.renew_browser_session(payload)
+
+    assert renewed is not None
+    token, max_age = renewed
+    claims = jwt.decode(token, options={"verify_signature": False})
+    assert claims["exp"] == payload["auth_time"] + 10 * 3600
+    assert claims["exp"] == claims["iat"] + max_age
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_logout_on_one_replica_ends_the_session_on_others(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """Replicas sharing a database honour each other's logouts, and so does a restart.
+
+    Accounts mode checks every request. An OIDC replica that already cached
+    the cookie may accept it until the cache recheck window ends, but never
+    renews it.
+    """
+
+    def replica() -> UnifiedAuthProvider:
+        provider = _provider(source, _HTTP)
+        provider.set_session_revocation_store(BrowserSessionRevocationStore(db_uri))
+        if source == "accounts":
+            provider.set_account_check(lambda user, generation: True)
+        return provider
+
+    replica_a, replica_b = replica(), replica()
+    name = _cookie_name(_HTTP)
+    aged = _session_jwt(remaining=600)
+    headers = _cookie(name, aged)
+    with TestClient(_probe_app(replica_b)) as client_b:
+        assert len(_session_set_cookies(client_b.get(_PROBE, headers=headers), name)) == 1
+
+        replica_a.end_browser_session(_Conn(cookies={name: aged}))  # type: ignore[arg-type]
+
+        resp = client_b.get(_PROBE, headers=headers)
+        assert _session_set_cookies(resp, name) == []
+        if source == "accounts":
+            assert resp.status_code == 401
+        else:
+            assert resp.status_code == 200  # cached, inside the recheck window
+            real_monotonic = time.monotonic
+            monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 61)
+            assert client_b.get(_PROBE, headers=headers).status_code == 401
+
+    restarted = replica()
+    assert restarted.get_user_id(_Conn(cookies={name: aged})) is None  # type: ignore[arg-type]
+    assert restarted.renew_browser_session(_decode(aged)) is None
+
+
+def test_account_generation_change_blocks_response_time_renewal() -> None:
+    """A generation bump between authentication and response start yields no cookie."""
+    provider = _provider("accounts", _HTTP)
+    current = {"generation": "gen-1"}
+    provider.set_account_check(lambda user, generation: generation == current["generation"])
+    payload = _decode(_session_jwt(remaining=600))
+    assert provider.renew_browser_session(payload) is not None
+
+    current["generation"] = "gen-2"
+
+    assert provider.renew_browser_session(payload) is None

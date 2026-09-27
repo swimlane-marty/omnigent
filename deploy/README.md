@@ -433,7 +433,16 @@ signs in again at most once per max lifetime.
 | `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle window: an unused session expires after this long. |
 | `OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` / `OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS` | `720` (30 days) | Absolute limit from login. Must be at least the idle window. Set it equal to the idle window to turn renewal off. |
 
-Signing out ends the session and every renewed cookie descended from it.
+Signing out ends the session and every renewed cookie descended from it. The
+logout is recorded in the server's database until the session's max lifetime,
+so it holds on every replica sharing that database and survives restarts. In
+accounts mode another replica rejects the cookie on its next request. In OIDC
+mode a replica that validated the cookie within the last minute may keep
+accepting it for up to a minute more, but no replica will renew it. Sign-out
+ends only the browser cookie. A CLI holding the same token as a Bearer (the OIDC
+`omnigent login` browser flow hands one token to both) keeps it until it
+expires on its own.
+
 Cookies issued before an upgrade to this behavior are not renewed. They expire
 on schedule, and the next login issues one that renews. CLI and host tokens
 (`omnigent login`) renew through their refresh grants instead. In OIDC mode the

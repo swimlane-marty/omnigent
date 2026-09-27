@@ -418,6 +418,9 @@ _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
 # Scope key holding the claims of a session cookie that is due for renewal;
 # set by ``_check_cookie`` and consumed by :class:`SessionRenewalMiddleware`.
 _SESSION_RENEWAL_KEY = "omnigent.session_renewal"
+# How long a cached browser-session identity is trusted before a logout on
+# another replica, recorded in the shared revocation store, is re-checked.
+_SESSION_REVOCATION_RECHECK_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -492,9 +495,12 @@ class UnifiedAuthProvider(AuthProvider):
         # decoded claims). Claims let a cache hit still apply the logout and
         # absolute-lifetime checks and offer renewal.
         self._cookie_cache: dict[str, tuple[str, float, dict[str, Any]]] = {}
-        # Browser-session ids (``sid``) ended by logout -> the wall-clock time
-        # after which no token of that session can be valid anyway.
+        # Browser-session ids (``sid``) ended by logout in this process -> the
+        # wall-clock time after which no token of that session can be valid.
+        # A local fast path; the shared store below is authoritative.
         self._ended_sessions: dict[str, float] = {}
+        # Set by create_app: durable, cross-replica record of ended sessions.
+        self._session_revocations: BrowserSessionRevocationStore | None = None
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
@@ -511,6 +517,10 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_session_revocation_store(self, store: BrowserSessionRevocationStore) -> None:
+        """Wire the shared store that records browser sessions ended by logout."""
+        self._session_revocations = store
 
     def set_account_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire uncached generation/revocation validation in accounts mode."""
@@ -666,7 +676,12 @@ class UnifiedAuthProvider(AuthProvider):
         cached = self._cookie_cache.get(cache_key)
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
             cached_user, _, cached_payload = cached
-            if not self._session_still_live(cached_payload, from_cookie=from_cookie):
+            now = time.time()
+            # The deadline is monotonic; wall time is what ``exp`` is measured in.
+            if cached_payload.get("exp", 0) <= now:
+                self._cookie_cache.pop(cache_key, None)
+                return None
+            if not self._session_still_live(cached_payload, from_cookie=from_cookie, now=now):
                 return None
             self._offer_renewal(request, cached_payload, from_cookie=from_cookie)
             return cached_user
@@ -683,7 +698,9 @@ class UnifiedAuthProvider(AuthProvider):
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
-        if not self._session_still_live(payload, from_cookie=from_cookie):
+        if not self._session_still_live(
+            payload, from_cookie=from_cookie, now=time.time(), durable=True
+        ):
             return None
 
         # Machine-issued tokens carry ``grant_id`` (store-backed grant),
@@ -726,6 +743,8 @@ class UnifiedAuthProvider(AuthProvider):
 
         if self._account_check is None:
             remaining = payload.get("exp", 0) - time.time()
+            if isinstance(payload.get("sid"), str):
+                remaining = min(remaining, _SESSION_REVOCATION_RECHECK_SECONDS)
             if remaining > 0:
                 self._prune_cookie_cache()
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining, payload)
@@ -743,7 +762,14 @@ class UnifiedAuthProvider(AuthProvider):
             if deadline <= now:
                 self._cookie_cache.pop(key, None)
 
-    def _session_still_live(self, payload: dict[str, Any], *, from_cookie: bool) -> bool:
+    def _session_still_live(
+        self,
+        payload: dict[str, Any],
+        *,
+        from_cookie: bool,
+        now: float,
+        durable: bool = False,
+    ) -> bool:
         """Apply the browser-session checks the JWT ``exp`` cannot express.
 
         A token carrying ``auth_time`` is rejected once its login is older
@@ -755,6 +781,9 @@ class UnifiedAuthProvider(AuthProvider):
 
         :param payload: Signature-verified JWT claims.
         :param from_cookie: Whether the token came from the session cookie.
+        :param now: Current wall-clock time, read once by the caller.
+        :param durable: Also consult the shared revocation store, so a
+            logout on another replica or before a restart counts.
         :returns: ``False`` when the token must be treated as unauthenticated.
         """
         auth_time = payload.get("auth_time")
@@ -763,30 +792,37 @@ class UnifiedAuthProvider(AuthProvider):
         config = self._session_config()
         if config is None or not isinstance(auth_time, int) or isinstance(auth_time, bool):
             return False
-        if time.time() >= auth_time + config.session_max_lifetime_seconds:
+        if now >= auth_time + config.session_max_lifetime_seconds:
             return False
         sid = payload.get("sid")
-        return not (from_cookie and isinstance(sid, str) and sid in self._ended_sessions)
+        if not from_cookie or not isinstance(sid, str):
+            return True
+        if sid in self._ended_sessions:
+            return False
+        store = self._session_revocations
+        return not (durable and store is not None and store.is_revoked(sid))
 
-    def _renewed_expiry(self, payload: dict[str, Any]) -> int | None:
-        """Return the ``exp`` a renewal of *payload* would get, or ``None``.
+    def _renewed_expiry(self, payload: dict[str, Any], now: int) -> int | None:
+        """Return the ``exp`` a renewal of *payload* at *now* would get, or ``None``.
 
         ``None`` when the token is not a renewable browser session (no
-        ``auth_time``/``sid``, i.e. legacy or machine-minted), is still in
-        the first half of its idle window, or is already pinned at its
-        absolute lifetime so renewal would not extend it.
+        ``auth_time``/``sid``, i.e. legacy or machine-minted), has already
+        expired, is still in the first half of its idle window, or is
+        already pinned at its absolute lifetime so renewal would not
+        extend it.
         """
         config = self._session_config()
         auth_time = payload.get("auth_time")
         exp = payload.get("exp")
+        sid = payload.get("sid")
         if (
             config is None
             or not isinstance(auth_time, int)
             or not isinstance(exp, int)
-            or not isinstance(payload.get("sid"), str)
+            or not isinstance(sid, str)
+            or exp <= now
         ):
             return None
-        now = int(time.time())
         ttl_seconds = config.session_ttl_hours * 3600
         if exp - now >= ttl_seconds / 2:
             return None
@@ -806,51 +842,64 @@ class UnifiedAuthProvider(AuthProvider):
             return
         if payload.get("grant_id") is not None or payload.get("scope") is not None:
             return
-        if self._renewed_expiry(payload) is not None:
+        if self._renewed_expiry(payload, int(time.time())) is not None:
             request.scope[_SESSION_RENEWAL_KEY] = payload
 
     def renew_browser_session(self, payload: dict[str, Any]) -> tuple[str, int] | None:
         """Mint the successor of a session cookie marked for renewal.
 
-        Re-checks logout and the absolute lifetime at response time, so a
-        request racing a logout never hands back a live cookie. The new JWT
-        keeps ``sub``, ``provider``, ``account_generation``, ``auth_time``
-        and ``sid``; only ``iat`` and ``exp`` move.
+        Everything is re-checked against one clock reading taken at
+        response time: the old token's ``exp``, the absolute lifetime,
+        logout (locally and in the shared store) and, in accounts mode, the
+        account generation. So a request that outlives its token, or races
+        a logout or account change, never hands back a live cookie. The new
+        JWT keeps ``sub``, ``provider``, ``account_generation``,
+        ``auth_time`` and ``sid``; only ``iat`` and ``exp`` move.
 
         :param payload: The verified claims ``_check_cookie`` marked.
         :returns: ``(jwt, max_age_seconds)``, or ``None`` to skip renewal.
         """
+        now = int(time.time())
         config = self._session_config()
-        renewed_exp = self._renewed_expiry(payload)
+        renewed_exp = self._renewed_expiry(payload, now)
         if (
             config is None
             or renewed_exp is None
-            or not self._session_still_live(payload, from_cookie=True)
+            or not self._session_still_live(payload, from_cookie=True, now=now, durable=True)
+        ):
+            return None
+        user_id = payload["sub"]
+        generation = payload.get("account_generation")
+        if self._account_check is not None and not (
+            isinstance(generation, str) and self._account_check(user_id, generation)
         ):
             return None
         from omnigent.server.oidc import mint_session_token
 
-        generation = payload.get("account_generation")
         provider = payload.get("provider")
-        max_age = renewed_exp - int(time.time())
+        max_age = renewed_exp - now
         token = mint_session_token(
-            payload["sub"],
+            user_id,
             config.cookie_secret,
             max_age,
             provider if isinstance(provider, str) else self._source,
             account_generation=generation if isinstance(generation, str) else None,
             auth_time=payload["auth_time"],
             session_id=payload["sid"],
+            issued_at=now,
         )
         return token, max_age
 
     def end_browser_session(self, request: HTTPConnection) -> None:
         """End the browser session whose cookie *request* carries (logout).
 
-        Records the cookie's ``sid`` so neither it nor any renewal of it
-        authenticates as a cookie again, and evicts its cached entries.
-        A cookie without a ``sid`` (legacy) is never renewed, so clearing
-        it is enough.
+        Records the cookie's ``sid`` in the shared revocation store (and
+        locally) until the session's absolute expiry, so neither it nor
+        any renewal of it authenticates as a cookie again on any replica,
+        and evicts its cached entries. The signature is verified but an
+        expired cookie still counts: a request that authenticated just
+        before expiry may still be renewing it. A cookie without a ``sid``
+        (legacy) is never renewed, so clearing it is enough.
 
         :param request: The logout request.
         """
@@ -863,21 +912,34 @@ class UnifiedAuthProvider(AuthProvider):
         if not token:
             return
         try:
-            payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+            payload = jwt.decode(
+                token,
+                config.cookie_secret,
+                algorithms=["HS256"],
+                options={"verify_exp": False},
+            )
         except jwt.InvalidTokenError:
             return
         sid = payload.get("sid")
         auth_time = payload.get("auth_time")
+        user_id = payload.get("sub")
         if not isinstance(sid, str) or not isinstance(auth_time, int):
             return
         now = time.time()
-        for ended_sid, until in list(self._ended_sessions.items()):
-            if until <= now:
+        until = auth_time + config.session_max_lifetime_seconds
+        if until <= now:
+            return
+        for ended_sid, ended_until in list(self._ended_sessions.items()):
+            if ended_until <= now:
                 self._ended_sessions.pop(ended_sid, None)
-        self._ended_sessions[sid] = auth_time + config.session_max_lifetime_seconds
+        self._ended_sessions[sid] = until
         for key, (_, _, cached_payload) in list(self._cookie_cache.items()):
             if cached_payload.get("sid") == sid:
                 self._cookie_cache.pop(key, None)
+        if self._session_revocations is not None:
+            self._session_revocations.revoke(
+                sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
+            )
 
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the trusted identity header and return the user ID.
@@ -1005,12 +1067,12 @@ class SessionRenewalMiddleware:
 
         async def send_with_renewal(message: Message) -> None:
             if message["type"] == "http.response.start":
-                message = self._with_renewed_cookie(scope, message)
+                message = await self._with_renewed_cookie(scope, message)
             await send(message)
 
         await self._app(scope, receive, send_with_renewal)
 
-    def _with_renewed_cookie(self, scope: Scope, message: Message) -> Message:
+    async def _with_renewed_cookie(self, scope: Scope, message: Message) -> Message:
         from starlette.responses import Response
 
         from omnigent.server.oidc import set_session_cookie
@@ -1026,7 +1088,8 @@ class SessionRenewalMiddleware:
             for name, value in headers
         ):
             return message
-        renewed = self._auth_provider.renew_browser_session(payload)
+        # Renewal may consult the database (revocations, account generation).
+        renewed = await asyncio.to_thread(self._auth_provider.renew_browser_session, payload)
         if renewed is None:
             return message
         token, max_age = renewed
@@ -1126,4 +1189,5 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.browser_session_store import BrowserSessionRevocationStore
     from omnigent.server.oidc import OIDCConfig

@@ -3771,6 +3771,12 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            from omnigent.server.browser_session_store import BrowserSessionRevocationStore
+
+            # Logout must end a browser session on every replica and across restarts.
+            auth_provider.set_session_revocation_store(
+                BrowserSessionRevocationStore(permission_store.storage_location)
+            )
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)

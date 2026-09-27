@@ -5,7 +5,8 @@ A real ``omnigent server`` runs in accounts mode. The test signs in through
 past half of its idle window (re-signed with the server's own cookie secret,
 keeping the login's identity and session id, so the test need not wait hours).
 The server must answer with a fresh cookie that keeps the original login time,
-accept that cookie without renewing it again, and after logout accept neither.
+accept that cookie without renewing it again, and after logout accept neither,
+including after the server restarts on the same database.
 
 Usage::
 
@@ -18,7 +19,8 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -50,14 +52,13 @@ def _await_health(base_url: str, log_path: Path) -> None:
     raise RuntimeError(f"accounts server did not become healthy. Log:\n{tail}")
 
 
-@pytest.fixture()
-def accounts_server(tmp_path: Path) -> Iterator[str]:
+@contextmanager
+def _run_server(tmp_path: Path, port: int, log_name: str) -> Iterator[str]:
     """Run a real ``omnigent server`` subprocess with accounts auth enabled."""
-    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
-    log_path = tmp_path / "server.log"
+    artifact_dir.mkdir(exist_ok=True)
+    log_path = tmp_path / log_name
 
     env = {**os.environ}
     env["OMNIGENT_AUTH_PROVIDER"] = "accounts"
@@ -102,6 +103,24 @@ def accounts_server(tmp_path: Path) -> Iterator[str]:
         log_handle.close()
 
 
+@pytest.fixture()
+def accounts_server(tmp_path: Path) -> Iterator[tuple[str, Callable[[], str]]]:
+    """A running accounts server plus a callable that restarts it on the same DB."""
+    port = find_free_port()
+    servers = [_run_server(tmp_path, port, "server.log")]
+    base_url = servers[0].__enter__()
+
+    def restart() -> str:
+        servers[-1].__exit__(None, None, None)
+        servers.append(_run_server(tmp_path, port, f"server-{len(servers)}.log"))
+        return servers[-1].__enter__()
+
+    try:
+        yield base_url, restart
+    finally:
+        servers[-1].__exit__(None, None, None)
+
+
 def _session_cookies(resp: httpx.Response) -> list[str]:
     return [h for h in resp.headers.get_list("set-cookie") if h.startswith("ap_session=")]
 
@@ -115,8 +134,11 @@ def _me(base_url: str, token: str) -> httpx.Response:
     )
 
 
-def test_active_browser_session_is_renewed_until_logout(accounts_server: str) -> None:
-    """Login → aged cookie renewed → renewed cookie works → logout ends it."""
+def test_active_browser_session_is_renewed_until_logout(
+    accounts_server: tuple[str, Callable[[], str]],
+) -> None:
+    """Login → aged cookie renewed → renewed cookie works → logout ends it for good."""
+    accounts_server, restart = accounts_server
     secret = bytes.fromhex(_COOKIE_SECRET_HEX)
     login = httpx.post(
         f"{accounts_server}/auth/login",
@@ -166,5 +188,12 @@ def test_active_browser_session_is_renewed_until_logout(accounts_server: str) ->
     assert logout.status_code == 204
     for token in (renewed, aged):
         after = _me(accounts_server, token)
+        assert after.status_code == 401, after.text
+        assert _session_cookies(after) == []
+
+    # The logout is durable: a restarted server still refuses the session.
+    restarted = restart()
+    for token in (renewed, aged):
+        after = _me(restarted, token)
         assert after.status_code == 401, after.text
         assert _session_cookies(after) == []

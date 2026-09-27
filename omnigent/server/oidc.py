@@ -63,6 +63,7 @@ def mint_session_token(
     account_generation: str | None = None,
     auth_time: int | None = None,
     session_id: str | None = None,
+    issued_at: int | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -86,9 +87,12 @@ def mint_session_token(
     :param session_id: Opaque browser-session id (the ``sid`` claim),
         carried unchanged across renewals so logout can end the whole
         chain.
+    :param issued_at: The ``iat`` to stamp, from the caller's single clock
+        reading, so ``exp`` is exactly ``issued_at + ttl_seconds``.
+        Defaults to now.
     :returns: An HS256-signed JWT string.
     """
-    now = int(time.time())
+    now = int(time.time()) if issued_at is None else issued_at
     payload: dict[str, str | int] = {
         "sub": user_id,
         "iat": now,
