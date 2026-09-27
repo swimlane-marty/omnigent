@@ -291,6 +291,8 @@ class OIDCConfig:
         The IdP is only consulted at login, so this is also the longest an
         active browser keeps access after the user is deprovisioned at
         the IdP; set it equal to ``session_ttl_hours`` to disable renewal.
+        Renewal also needs the database-backed logout record, so a
+        ``create_app`` without a ``permission_store`` never renews.
     """
 
     issuer: str

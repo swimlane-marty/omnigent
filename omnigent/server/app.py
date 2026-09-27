@@ -4005,10 +4005,18 @@ def create_app(
         "accounts",
         "oidc",
     ):
-        from omnigent.server.auth import SessionRenewalMiddleware
+        if auth_provider.renews_browser_sessions:
+            from omnigent.server.auth import SessionRenewalMiddleware
 
-        # Slide the browser session cookie forward for active users.
-        app.add_middleware(SessionRenewalMiddleware, auth_provider=auth_provider)
+            # Slide the browser session cookie forward for active users.
+            app.add_middleware(SessionRenewalMiddleware, auth_provider=auth_provider)
+        else:
+            _logger.warning(
+                "Browser session renewal is disabled: no permission store, so there is "
+                "no shared database to record logouts in. Session cookies keep their "
+                "fixed expiry (%s auth mode).",
+                auth_provider._source,
+            )
     app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before

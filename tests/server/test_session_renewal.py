@@ -20,7 +20,7 @@ import secrets
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import jwt
@@ -72,13 +72,15 @@ def _clear_ambient_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # ── Helpers ───────────────────────────────────────────────────────
 
 
-def _config(source: str, origin: str, *, max_hours: int = 720) -> AccountsConfig | OIDCConfig:
+def _config(
+    source: str, origin: str, *, max_hours: int = 720, init_admin_password: str | None = None
+) -> AccountsConfig | OIDCConfig:
     if source == "accounts":
         return AccountsConfig(
             cookie_secret=_SECRET,
             session_ttl_hours=_TTL_HOURS,
             base_url=origin,
-            init_admin_password=None,
+            init_admin_password=init_admin_password,
             invite_ttl_seconds=3600,
             magic_ttl_seconds=600,
             session_max_lifetime_hours=max_hours,
@@ -103,11 +105,42 @@ def _config(source: str, origin: str, *, max_hours: int = 720) -> AccountsConfig
     )
 
 
-def _provider(source: str, origin: str, *, max_hours: int = 720) -> UnifiedAuthProvider:
-    config = _config(source, origin, max_hours=max_hours)
+class _MemoryRevocations:
+    """In-memory stand-in for the database-backed logout record.
+
+    Renewal is only enabled once a revocation store is wired; tests that
+    need the real, shared store wire :class:`BrowserSessionRevocationStore`.
+    """
+
+    def __init__(self) -> None:
+        self.ended: dict[str, int] = {}
+
+    def revoke(self, sid: str, *, user_id: str, expires_at: int) -> None:
+        self.ended[sid] = expires_at
+
+    def is_revoked(self, sid: str) -> bool:
+        return self.ended.get(sid, 0) > time.time()
+
+
+def _provider(
+    source: str,
+    origin: str,
+    *,
+    max_hours: int = 720,
+    durable: bool = True,
+    init_admin_password: str | None = None,
+) -> UnifiedAuthProvider:
+    """A provider in *source* mode; ``durable`` wires an in-memory logout record."""
+    config = _config(source, origin, max_hours=max_hours, init_admin_password=init_admin_password)
     if isinstance(config, AccountsConfig):
-        return UnifiedAuthProvider(source="accounts", accounts_config=config)
-    return UnifiedAuthProvider(source="oidc", oidc_config=config)
+        provider = UnifiedAuthProvider(source="accounts", accounts_config=config)
+    else:
+        provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    if durable:
+        provider.set_session_revocation_store(
+            cast(BrowserSessionRevocationStore, _MemoryRevocations())
+        )
+    return provider
 
 
 def _cookie_name(origin: str) -> str:
@@ -783,15 +816,24 @@ def test_max_lifetime_invalid_fails_loud(
 # ── Production wiring ────────────────────────────────────────────
 
 
-def test_create_app_renews_oidc_session_cookie(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``create_app`` installs renewal in OIDC mode (accounts: see above)."""
+def _create_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: UnifiedAuthProvider,
+    *,
+    with_permission_store: bool,
+) -> FastAPI:
+    """``create_app`` with *provider*, with or without a permission store.
+
+    Accounts mode also gets the account store ``create_app`` requires;
+    bootstrap creates ``admin`` from the provider's init admin password.
+    """
     from omnigent.db.utils import get_or_create_engine
     from omnigent.runtime import init as init_runtime
     from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
     from omnigent.server.app import create_app
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -805,7 +847,10 @@ def test_create_app_renews_oidc_session_cookie(
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
-    db_url = f"sqlite:///{tmp_path}/oidc.db"
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-creds"))
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_AUTO_OPEN", "0")
+    db_url = f"sqlite:///{tmp_path}/app.db"
     get_or_create_engine(db_url)
     telemetry.init()
     agent_store = SqlAlchemyAgentStore(db_url)
@@ -823,18 +868,27 @@ def test_create_app_renews_oidc_session_cookie(
         artifact_store=artifact_store,
         comment_store=comment_store,
     )
-    app = create_app(
+    return create_app(
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
         comment_store=comment_store,
-        permission_store=SqlAlchemyPermissionStore(db_url),
+        permission_store=SqlAlchemyPermissionStore(db_url) if with_permission_store else None,
         host_store=HostStore(db_url),
-        auth_provider=_provider("oidc", _HTTP),
-        account_store=None,
+        auth_provider=provider,
+        account_store=SqlAlchemyAccountStore(db_url) if provider._source == "accounts" else None,
     )
+
+
+def test_create_app_renews_oidc_session_cookie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``create_app`` installs renewal in OIDC mode (accounts: see above)."""
+    provider = _provider("oidc", _HTTP, durable=False)
+    app = _create_app(tmp_path, monkeypatch, provider, with_permission_store=True)
+    assert isinstance(provider._session_revocations, BrowserSessionRevocationStore)
     name = _cookie_name(_HTTP)
     with TestClient(app) as client:
         resp = client.get("/v1/me", headers=_cookie(name, _session_jwt(remaining=600)))
@@ -842,6 +896,71 @@ def test_create_app_renews_oidc_session_cookie(
         assert resp.status_code == 200, resp.text
         assert resp.json()["user_id"] == _USER
         assert _decode(_renewed_token(resp, name))["sid"] == "sid-abc"
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_create_app_without_permission_store_never_renews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    """With no shared database to record logouts in, cookies keep a fixed expiry.
+
+    Logout is then never weaker than before renewal existed: no replica
+    or restarted server can extend a logged-out cookie.
+    """
+    import omnigent.server.app as app_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        app_module._logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+    provider = _provider(source, _HTTP, durable=False, init_admin_password="admin-pw-12345")
+    app = _create_app(tmp_path, monkeypatch, provider, with_permission_store=False)
+
+    assert not provider.renews_browser_sessions
+    assert not any(m.cls is SessionRenewalMiddleware for m in app.user_middleware)
+    assert [w for w in warnings if "renewal is disabled" in w] == [
+        "Browser session renewal is disabled: no permission store, so there is no shared "
+        f"database to record logouts in. Session cookies keep their fixed expiry ({source} "
+        "auth mode)."
+    ]
+    name = _cookie_name(_HTTP)
+    with TestClient(app) as client:
+        claims: dict[str, Any] = {"provider": source}
+        if source == "accounts":
+            _login(client, "admin", "admin-pw-12345")
+            login_claims = _decode(client.cookies[name])
+            claims.update(
+                sub="admin",
+                account_generation=login_claims["account_generation"],
+                sid=login_claims["sid"],
+            )
+        aged = _session_jwt(remaining=600, **claims)
+        resp = client.get("/v1/me", headers=_cookie(name, aged))
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["user_id"] == claims.get("sub", _USER)
+        assert _session_set_cookies(resp, name) == []
+        # Nothing else can renew it either: the provider itself refuses.
+        assert provider.renew_browser_session(_decode(aged)) is None
+        marked = _Conn(cookies={name: aged})
+        assert provider.get_user_id(marked) is not None  # type: ignore[arg-type]
+        assert _SESSION_RENEWAL_KEY not in marked.scope
+
+
+def test_oidc_logout_without_permission_store_still_ends_the_cookie(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a shared store, logout still clears the cookie and ends it in-process."""
+    provider = _provider("oidc", _HTTP, durable=False)
+    app = _create_app(tmp_path, monkeypatch, provider, with_permission_store=False)
+    name = _cookie_name(_HTTP)
+    aged = _session_jwt(remaining=600, provider="oidc")
+    with TestClient(app) as client:
+        logout = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
+
+        assert logout.status_code == 302
+        assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
+        assert client.get("/v1/me", headers=_cookie(name, aged)).status_code == 401
 
 
 # ── Review round 1 regressions ───────────────────────────────────
@@ -1011,3 +1130,90 @@ def test_account_generation_change_blocks_response_time_renewal() -> None:
     current["generation"] = "gen-2"
 
     assert provider.renew_browser_session(payload) is None
+
+
+# ── Review round 2 regressions ───────────────────────────────────
+
+
+def _on_event_loop() -> bool:
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+class _FailingRevocations(_MemoryRevocations):
+    """A shared store whose writes fail, recording which thread tried."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_on_event_loop: list[bool] = []
+
+    def revoke(self, sid: str, *, user_id: str, expires_at: int) -> None:
+        self.write_on_event_loop.append(_on_event_loop())
+        raise RuntimeError("database unavailable")
+
+
+def test_logout_store_failure_is_logged_and_session_still_ended_locally(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = _provider("oidc", _HTTP, durable=False)
+    failing = _FailingRevocations()
+    provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, failing))
+    token = _session_jwt(remaining=600)
+
+    with caplog.at_level("ERROR", logger="omnigent.server.auth"):
+        provider.end_browser_session(_Conn(cookies={"ap_session": token}))  # type: ignore[arg-type]
+
+    assert failing.write_on_event_loop == [False]
+    assert "sid-abc" in provider._ended_sessions
+    assert any("Could not record logout" in r.getMessage() for r in caplog.records)
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("origin", [_HTTP, _HTTPS])
+def test_oidc_logout_clears_cookie_when_store_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
+) -> None:
+    """OIDC logout writes off the event loop and always clears the cookie."""
+    client, provider = _oidc_client(monkeypatch, tmp_path, origin)
+    failing = _FailingRevocations()
+    provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, failing))
+    name = _cookie_name(origin)
+    aged = _session_jwt(remaining=600, provider="oidc")
+    with client:
+        logout = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
+
+        assert logout.status_code == 302
+        assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
+        assert failing.write_on_event_loop == [False]
+        after = client.get(_PROBE, headers=_cookie(name, aged))
+        assert after.status_code == 401
+        assert _session_set_cookies(after, name) == []
+
+
+def test_accounts_logout_clears_cookie_when_store_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accounts logout writes off the event loop and always clears the cookie."""
+    calls: list[bool] = []
+
+    def failing_revoke(self: object, sid: str, *, user_id: str, expires_at: int) -> None:
+        calls.append(_on_event_loop())
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(BrowserSessionRevocationStore, "revoke", failing_revoke)
+    for client in _build_accounts_app(tmp_path, monkeypatch, init_admin_password="admin-pw-12345"):
+        name = _cookie_name(_HTTP)
+        _login(client, "admin", "admin-pw-12345")
+        token = client.cookies[name]
+
+        logout = client.post("/auth/logout", headers=_cookie(name, token))
+
+        assert logout.status_code == 204
+        assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
+        assert calls == [False]
+        assert client.get("/auth/me", headers=_cookie(name, token)).status_code == 401

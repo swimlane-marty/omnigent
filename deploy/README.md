@@ -433,6 +433,12 @@ signs in again at most once per max lifetime.
 | `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle window: an unused session expires after this long. |
 | `OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` / `OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS` | `720` (30 days) | Absolute limit from login. Must be at least the idle window. Set it equal to the idle window to turn renewal off. |
 
+Renewal relies on the server's database to record sign-outs, and every deploy
+here (and `omnigent server`) has one. A custom embedding that calls
+`create_app` without a `permission_store` has no shared place to record them,
+so it turns renewal off and logs a warning at startup. Its session cookies keep
+the fixed expiry set at login, as before renewal existed.
+
 Signing out ends the session and every renewed cookie descended from it. The
 logout is recorded in the server's database until the session's max lifetime,
 so it holds on every replica sharing that database and survives restarts. In

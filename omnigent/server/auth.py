@@ -519,8 +519,19 @@ class UnifiedAuthProvider(AuthProvider):
         self._grant_revoked = check
 
     def set_session_revocation_store(self, store: BrowserSessionRevocationStore) -> None:
-        """Wire the shared store that records browser sessions ended by logout."""
+        """Wire the shared store that records browser sessions ended by logout.
+
+        Sliding renewal is enabled only once this is wired: without a
+        durable, cross-replica record, a logged-out cookie copy could be
+        renewed on another replica or after a restart. Unwired, cookies
+        keep their fixed login-time expiry.
+        """
         self._session_revocations = store
+
+    @property
+    def renews_browser_sessions(self) -> bool:
+        """Whether session cookies slide forward (see :meth:`set_session_revocation_store`)."""
+        return self._source in ("accounts", "oidc") and self._session_revocations is not None
 
     def set_account_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire uncached generation/revocation validation in accounts mode."""
@@ -838,6 +849,8 @@ class UnifiedAuthProvider(AuthProvider):
         callers, delegated/machine tokens (``grant_id`` / ``scope``) and
         WebSocket handshakes (which cannot reliably set cookies) never do.
         """
+        if not self.renews_browser_sessions:
+            return
         if not from_cookie or request.scope.get("type") != "http":
             return
         if payload.get("grant_id") is not None or payload.get("scope") is not None:
@@ -859,6 +872,8 @@ class UnifiedAuthProvider(AuthProvider):
         :param payload: The verified claims ``_check_cookie`` marked.
         :returns: ``(jwt, max_age_seconds)``, or ``None`` to skip renewal.
         """
+        if not self.renews_browser_sessions:
+            return None
         now = int(time.time())
         config = self._session_config()
         renewed_exp = self._renewed_expiry(payload, now)
@@ -896,7 +911,9 @@ class UnifiedAuthProvider(AuthProvider):
         Records the cookie's ``sid`` in the shared revocation store (and
         locally) until the session's absolute expiry, so neither it nor
         any renewal of it authenticates as a cookie again on any replica,
-        and evicts its cached entries. The signature is verified but an
+        and evicts its cached entries. A store failure is logged, never
+        raised: the local record still holds and the logout response must
+        always clear the cookie. The signature is verified but an
         expired cookie still counts: a request that authenticated just
         before expiry may still be renewing it. A cookie without a ``sid``
         (legacy) is never renewed, so clearing it is enough.
@@ -937,9 +954,15 @@ class UnifiedAuthProvider(AuthProvider):
             if cached_payload.get("sid") == sid:
                 self._cookie_cache.pop(key, None)
         if self._session_revocations is not None:
-            self._session_revocations.revoke(
-                sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
-            )
+            try:
+                self._session_revocations.revoke(
+                    sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
+                )
+            except Exception:
+                logger.exception(
+                    "Could not record logout of a browser session in the shared store; "
+                    "other replicas may accept its cookie until it expires"
+                )
 
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the trusted identity header and return the user ID.

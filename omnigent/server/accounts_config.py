@@ -40,7 +40,10 @@ Env vars (all start with ``OMNIGENT_ACCOUNTS_``):
   lapse at their original expiry and the next login mints a renewable
   one. Only the session cookie slides; ``Authorization: Bearer`` tokens
   and delegated tokens (``grant_id`` / ``scope``) keep their fixed
-  expiry and renew through their refresh grants instead.
+  expiry and renew through their refresh grants instead. Renewal needs
+  the database-backed logout record, so a ``create_app`` without a
+  ``permission_store`` never renews (see
+  :meth:`UnifiedAuthProvider.set_session_revocation_store`).
 - ``BASE_URL`` — required. The user-facing base URL of the
   deployment, e.g. ``"https://omnigent.example.com"`` or
   ``"http://localhost:6767"``. Determines whether session cookies

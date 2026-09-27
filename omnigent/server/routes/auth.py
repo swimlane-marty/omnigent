@@ -12,6 +12,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -563,7 +564,8 @@ def create_auth_router(
 
         :returns: 302 redirect with the session cookie cleared.
         """
-        auth_provider.end_browser_session(request)
+        # Records the logout in the shared store; never raises.
+        await asyncio.to_thread(auth_provider.end_browser_session, request)
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)

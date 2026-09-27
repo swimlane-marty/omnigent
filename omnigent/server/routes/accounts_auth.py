@@ -24,6 +24,7 @@ password hash, not an IdP authorization code exchange.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -364,7 +365,8 @@ def create_accounts_auth_router(
     @router.post("/logout")
     async def logout(request: Request) -> Response:
         """End the browser session and clear its cookie. Always 204 (no body)."""
-        auth_provider.end_browser_session(request)
+        # Records the logout in the shared store; never raises.
+        await asyncio.to_thread(auth_provider.end_browser_session, request)
         resp = Response(status_code=204)
         _clear_session_cookie(resp, cookie_name=_session_cookie, secure=_secure)
         return resp
