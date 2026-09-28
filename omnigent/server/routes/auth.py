@@ -565,30 +565,31 @@ def create_auth_router(
 
         If the logout cannot be recorded in the shared store, answers 503
         with an error page instead of redirecting (the browser navigated
-        here, so the page is what the user sees). The cookie is cleared
-        either way.
+        here, so the page is what the user sees), keeps the session cookie
+        and skips any IdP end-session hop: the session is still live, and
+        the page's "Try again" link re-runs this logout.
 
-        :returns: 302 redirect, or 503, with the session cookie cleared.
+        :returns: 302 redirect with the session cookie cleared, or 503.
         """
         recorded = await asyncio.to_thread(auth_provider.end_browser_session, request)
         base_path = getattr(request.app.state, "base_path", "")
-        response: Response
-        if recorded:
-            redirect_url = config.logout_redirect_uri or f"{base_path}/"
-            response = RedirectResponse(url=redirect_url, status_code=302)
-        else:
+        if not recorded:
             import html as _html
 
-            response = HTMLResponse(
+            safe_base = _html.escape(base_path, quote=True)
+            return HTMLResponse(
                 status_code=503,
                 content=(
                     "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
-                    "<h2>Sign-out not recorded</h2>"
+                    "<h2>Sign-out failed</h2>"
                     f"<p>{_html.escape(LOGOUT_NOT_RECORDED_MESSAGE)}</p>"
-                    f"<p><a href='{_html.escape(base_path, quote=True)}/'>Back to the app</a></p>"
+                    f"<p><a href='{safe_base}/auth/logout'>Try again</a> · "
+                    f"<a href='{safe_base}/'>Back to the app</a></p>"
                     "</body></html>"
                 ),
             )
+        redirect_url = config.logout_redirect_uri or f"{base_path}/"
+        response = RedirectResponse(url=redirect_url, status_code=302)
         response.delete_cookie(
             key=_session_cookie,
             path="/",

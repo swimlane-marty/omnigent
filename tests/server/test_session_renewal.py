@@ -1210,73 +1210,123 @@ class _FailingRevocations(_MemoryRevocations):
         raise RuntimeError("database unavailable")
 
 
-def test_logout_store_failure_is_logged_and_session_still_ended_locally(
+def test_logout_store_failure_is_logged_and_leaves_the_session_intact(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A failed write records nothing, not even locally: the logout is all-or-nothing.
+
+    Marking the session ended only on this replica would sign the user out
+    here while a copy stays live everywhere else.
+    """
     provider = _provider("oidc", _HTTP, durable=False)
     failing = _FailingRevocations()
     provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, failing))
-    token = _session_jwt(remaining=600)
+    token = _session_jwt(remaining=_TTL - 10)
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
 
     with caplog.at_level("ERROR", logger="omnigent.server.auth"):
         recorded = provider.end_browser_session(_Conn(cookies={"ap_session": token}))  # type: ignore[arg-type]
 
     assert recorded is False
     assert failing.write_on_event_loop == [False]
-    assert "sid-abc" in provider._ended_sessions
+    assert provider._ended_sessions == {}
+    assert hmac_digest(token, _SECRET) in provider._cookie_cache
     assert any("Could not record logout" in r.getMessage() for r in caplog.records)
-    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) is None  # type: ignore[arg-type]
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
+    assert provider.renew_browser_session(_decode(_session_jwt(remaining=600))) is not None
+
+
+class _RecoveringRevocations(_MemoryRevocations):
+    """A shared store whose writes fail until ``healthy`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.healthy = False
+
+    def revoke(self, sid: str, *, user_id: str, expires_at: int) -> None:
+        if not self.healthy:
+            raise RuntimeError("database unavailable")
+        super().revoke(sid, user_id=user_id, expires_at=expires_at)
 
 
 @pytest.mark.parametrize("origin", [_HTTP, _HTTPS])
-def test_oidc_logout_clears_cookie_when_store_fails(
+def test_oidc_logout_keeps_session_when_store_fails_and_retry_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
 ) -> None:
-    """OIDC logout clears the cookie but reports a failed write as 503.
+    """OIDC: a failed write answers 503, keeps the cookie, and offers a retry.
 
-    No redirect (so no IdP end-session hop): the browser shows the error.
+    No redirect, so no IdP end-session hop. Once the store recovers the
+    same logout succeeds and clears the cookie.
     """
     client, provider = _oidc_client(monkeypatch, tmp_path, origin)
-    failing = _FailingRevocations()
-    provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, failing))
+    store = _RecoveringRevocations()
+    provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, store))
     name = _cookie_name(origin)
     aged = _session_jwt(remaining=600, provider="oidc")
     with client:
-        logout = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
+        failed = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
 
-        assert logout.status_code == 503
-        assert "location" not in logout.headers
-        assert "could not record the sign-out" in logout.text
-        assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
-        assert failing.write_on_event_loop == [False]
+        assert failed.status_code == 503
+        assert "location" not in failed.headers
+        assert "Sign-out failed" in failed.text
+        assert "href='/auth/logout'>Try again</a>" in failed.text
+        assert failed.headers.get_list("set-cookie") == []
+        still_in = client.get(_PROBE, headers=_cookie(name, aged))
+        assert still_in.status_code == 200
+        assert len(_session_set_cookies(still_in, name)) == 1  # still renewable
+
+        store.healthy = True
+        retry = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
+
+        assert retry.status_code == 302
+        assert _parse_set_cookie(_session_set_cookies(retry, name)[0])[2]["max-age"] == "0"
         after = client.get(_PROBE, headers=_cookie(name, aged))
         assert after.status_code == 401
         assert _session_set_cookies(after, name) == []
 
 
-def test_accounts_logout_clears_cookie_when_store_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("origin", [_HTTP, _HTTPS])
+def test_accounts_logout_keeps_session_when_store_fails_and_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
 ) -> None:
-    """Accounts logout clears the cookie but reports a failed write as 503."""
+    """Accounts: a failed write answers 503 and keeps the cookie; a retry succeeds."""
     calls: list[bool] = []
+    healthy = {"value": False}
+    real_revoke = BrowserSessionRevocationStore.revoke
 
-    def failing_revoke(self: object, sid: str, *, user_id: str, expires_at: int) -> None:
+    def flaky_revoke(
+        self: BrowserSessionRevocationStore, sid: str, *, user_id: str, expires_at: int
+    ) -> None:
         calls.append(_on_event_loop())
-        raise RuntimeError("database unavailable")
+        if not healthy["value"]:
+            raise RuntimeError("database unavailable")
+        real_revoke(self, sid, user_id=user_id, expires_at=expires_at)
 
-    monkeypatch.setattr(BrowserSessionRevocationStore, "revoke", failing_revoke)
-    for client in _build_accounts_app(tmp_path, monkeypatch, init_admin_password="admin-pw-12345"):
-        name = _cookie_name(_HTTP)
+    monkeypatch.setattr(BrowserSessionRevocationStore, "revoke", flaky_revoke)
+    for client in _build_accounts_app(
+        tmp_path, monkeypatch, init_admin_password="admin-pw-12345", base_url=origin
+    ):
+        name = _cookie_name(origin)
         _login(client, "admin", "admin-pw-12345")
         token = client.cookies[name]
+        sid = _decode(token, bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"]))["sid"]
 
-        logout = client.post("/auth/logout", headers=_cookie(name, token))
+        failed = client.post("/auth/logout", headers=_cookie(name, token))
 
-        assert logout.status_code == 503
-        assert "could not record the sign-out" in logout.json()["error"]
-        assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
+        assert failed.status_code == 503
+        assert "Sign-out failed" in failed.json()["error"]
+        assert failed.headers.get_list("set-cookie") == []
         assert calls == [False]
+        still_in = client.get("/auth/me", headers=_cookie(name, token))
+        assert still_in.status_code == 200 and still_in.json()["id"] == "admin"
+
+        healthy["value"] = True
+        retry = client.post("/auth/logout", headers=_cookie(name, token))
+
+        assert retry.status_code == 204
+        assert _parse_set_cookie(_session_set_cookies(retry, name)[0])[2]["max-age"] == "0"
         assert client.get("/auth/me", headers=_cookie(name, token)).status_code == 401
+        assert BrowserSessionRevocationStore(f"sqlite:///{tmp_path}/test.db").is_revoked(sid)
 
 
 # ── Review round 3 regressions ───────────────────────────────────

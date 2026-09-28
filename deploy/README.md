@@ -454,12 +454,12 @@ IdP is only consulted at login, so the max lifetime is also how long an active
 browser keeps access after a user is removed at the IdP. Lower it to match your
 deprovisioning policy.
 
-If the database write fails, sign-out still clears the cookie in that browser
-and ends the session on the server that handled it, but answers `503` instead
-of succeeding (OIDC shows an error page rather than redirecting, so the IdP
-end-session hop is skipped). Until the session's max lifetime, a copy of that
-cookie may still be accepted by other replicas, or by the same server after a
-restart. The server logs each failure.
+If the database write fails, sign-out fails as a whole: the server answers
+`503`, keeps the session cookie, and leaves the session valid everywhere, so the
+user is told they are still signed in and can try again once the database
+recovers. The web UI shows the error on the Settings page; in OIDC mode the
+error page offers a "Try again" link and skips the IdP end-session hop. The
+server logs each failure.
 
 **Rolling back.** Sign-outs are recorded in the `browser_session_revocations`
 table, which the database migration creates. Downgrading that migration drops

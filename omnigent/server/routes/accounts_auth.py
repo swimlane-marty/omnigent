@@ -372,15 +372,13 @@ def create_accounts_auth_router(
         """End the browser session and clear its cookie.
 
         204 (no body) once the logout is recorded in the shared store. If
-        that write fails, 503 with an error body; the cookie is cleared
-        either way.
+        that write fails, 503 with an error body and the cookie is kept:
+        the session is still live everywhere, so the user can retry.
         """
         recorded = await asyncio.to_thread(auth_provider.end_browser_session, request)
-        resp = (
-            Response(status_code=204)
-            if recorded
-            else JSONResponse(status_code=503, content={"error": LOGOUT_NOT_RECORDED_MESSAGE})
-        )
+        if not recorded:
+            return JSONResponse(status_code=503, content={"error": LOGOUT_NOT_RECORDED_MESSAGE})
+        resp = Response(status_code=204)
         _clear_session_cookie(resp, cookie_name=_session_cookie, secure=_secure)
         return resp
 

@@ -415,12 +415,11 @@ class AuthProvider(ABC):
 
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
-# Shown when logout cleared the cookie but could not record the session in
-# the shared store; signing out again cannot help, since the cookie is gone.
+# Shown when logout could not be recorded in the shared store. The session is
+# left fully intact, so signing out again can succeed once the store recovers.
 LOGOUT_NOT_RECORDED_MESSAGE = (
-    "You are signed out of this browser, but the server could not record the "
-    "sign-out, so a copy of this session may still work until it expires. "
-    "Contact your administrator."
+    "Sign-out failed: the server could not record it, so you are still signed in. "
+    "Try again in a moment."
 )
 # Scope key holding the claims of a session cookie that is due for renewal;
 # set by ``_check_cookie`` and consumed by :class:`SessionRenewalMiddleware`.
@@ -925,12 +924,13 @@ class UnifiedAuthProvider(AuthProvider):
     def end_browser_session(self, request: HTTPConnection) -> bool:
         """End the browser session whose cookie *request* carries (logout).
 
-        Records the cookie's ``sid`` in the shared revocation store (and
-        locally) until the session's absolute expiry, so neither it nor
-        any renewal of it authenticates as a cookie again on any replica,
-        and evicts its cached entries. A store failure is logged, not
-        raised, so the logout response can still clear the cookie; the
-        local record still holds, and the caller reports the failure. The
+        Records the cookie's ``sid`` in the shared revocation store, then
+        locally, until the session's absolute expiry, so neither it nor any
+        renewal of it authenticates as a cookie again on any replica, and
+        evicts its cached entries. The logout is all-or-nothing: if the
+        store write fails it is logged and nothing is recorded, not even
+        locally, so the session stays equally valid on every replica and
+        the user can retry; the caller must then keep the cookie. The
         signature is verified but an expired cookie still counts: a request
         that authenticated just before expiry may still be renewing it. A
         cookie without a ``sid`` (legacy) is never renewed, so clearing it
@@ -938,7 +938,8 @@ class UnifiedAuthProvider(AuthProvider):
 
         :param request: The logout request.
         :returns: ``False`` only when the shared store could not record the
-            session; ``True`` when it did or there was nothing to record.
+            session (nothing was changed); ``True`` when it was recorded or
+            there was nothing to record.
         """
         import jwt
 
@@ -966,6 +967,17 @@ class UnifiedAuthProvider(AuthProvider):
         until = auth_time + config.session_max_lifetime_seconds
         if until <= now:
             return True
+        if self._session_revocations is not None:
+            try:
+                self._session_revocations.revoke(
+                    sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
+                )
+            except Exception:
+                logger.exception(
+                    "Could not record logout of a browser session in the shared store; "
+                    "the session is left signed in so the user can retry"
+                )
+                return False
         for ended_sid, ended_until in list(self._ended_sessions.items()):
             if ended_until <= now:
                 self._ended_sessions.pop(ended_sid, None)
@@ -973,19 +985,6 @@ class UnifiedAuthProvider(AuthProvider):
         for key, (_, _, cached_payload) in list(self._cookie_cache.items()):
             if cached_payload.get("sid") == sid:
                 self._cookie_cache.pop(key, None)
-        if self._session_revocations is None:
-            return True
-        try:
-            self._session_revocations.revoke(
-                sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
-            )
-        except Exception:
-            logger.exception(
-                "Could not record logout of a browser session in the shared store; "
-                "other replicas, or this server after a restart, may accept its cookie "
-                "until the session's absolute expiry"
-            )
-            return False
         return True
 
     def _check_header(self, request: HTTPConnection) -> str | None:
