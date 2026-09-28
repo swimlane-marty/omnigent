@@ -415,12 +415,16 @@ class AuthProvider(ABC):
 
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
+# Shown when logout cleared the cookie but could not record the session in
+# the shared store; signing out again cannot help, since the cookie is gone.
+LOGOUT_NOT_RECORDED_MESSAGE = (
+    "You are signed out of this browser, but the server could not record the "
+    "sign-out, so a copy of this session may still work until it expires. "
+    "Contact your administrator."
+)
 # Scope key holding the claims of a session cookie that is due for renewal;
 # set by ``_check_cookie`` and consumed by :class:`SessionRenewalMiddleware`.
 _SESSION_RENEWAL_KEY = "omnigent.session_renewal"
-# How long a cached browser-session identity is trusted before a logout on
-# another replica, recorded in the shared revocation store, is re-checked.
-_SESSION_REVOCATION_RECHECK_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -675,9 +679,11 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_name = cookie_config.session_cookie_name
         token = request.cookies.get(cookie_name)
         from_cookie = bool(token)
+        auth_header = request.headers.get("Authorization", "")
+        # A request that also carries a Bearer credential never renews the cookie.
+        cookie_only = from_cookie and not auth_header.startswith("Bearer ")
         if not token:
             # Fall back to Bearer token for CLI clients.
-            auth_header = request.headers.get("Authorization", "")
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
         if not token:
@@ -692,9 +698,14 @@ class UnifiedAuthProvider(AuthProvider):
             if cached_payload.get("exp", 0) <= now:
                 self._cookie_cache.pop(cache_key, None)
                 return None
-            if not self._session_still_live(cached_payload, from_cookie=from_cookie, now=now):
+            # A logout on any replica must hold at once, so a cached cookie
+            # session is still checked against the shared revocation store.
+            if not self._session_still_live(
+                cached_payload, from_cookie=from_cookie, now=now, durable=True
+            ):
                 return None
-            self._offer_renewal(request, cached_payload, from_cookie=from_cookie)
+            self._offer_renewal(request, cached_payload, cookie_only=cookie_only)
+            self._evict_if_superseded(request, cache_key)
             return cached_user
 
         try:
@@ -754,13 +765,12 @@ class UnifiedAuthProvider(AuthProvider):
 
         if self._account_check is None:
             remaining = payload.get("exp", 0) - time.time()
-            if isinstance(payload.get("sid"), str):
-                remaining = min(remaining, _SESSION_REVOCATION_RECHECK_SECONDS)
             if remaining > 0:
                 self._prune_cookie_cache()
                 self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining, payload)
 
-        self._offer_renewal(request, payload, from_cookie=from_cookie)
+        self._offer_renewal(request, payload, cookie_only=cookie_only)
+        self._evict_if_superseded(request, cache_key)
         return user_id
 
     def _session_config(self) -> OIDCConfig | AccountsConfig | None:
@@ -772,6 +782,12 @@ class UnifiedAuthProvider(AuthProvider):
         for key, (_, deadline, _) in list(self._cookie_cache.items()):
             if deadline <= now:
                 self._cookie_cache.pop(key, None)
+
+    def _evict_if_superseded(self, request: HTTPConnection, cache_key: str) -> None:
+        """Once a renewal is staged, drop the replaced token's entry and expired ones."""
+        if _SESSION_RENEWAL_KEY in request.scope:
+            self._cookie_cache.pop(cache_key, None)
+            self._prune_cookie_cache()
 
     def _session_still_live(
         self,
@@ -841,17 +857,18 @@ class UnifiedAuthProvider(AuthProvider):
         return renewed_exp if renewed_exp > exp else None
 
     def _offer_renewal(
-        self, request: HTTPConnection, payload: dict[str, Any], *, from_cookie: bool
+        self, request: HTTPConnection, payload: dict[str, Any], *, cookie_only: bool
     ) -> None:
         """Mark an HTTP request whose session cookie is due for renewal.
 
-        Only a plain user session presented as the cookie qualifies: Bearer
-        callers, delegated/machine tokens (``grant_id`` / ``scope``) and
-        WebSocket handshakes (which cannot reliably set cookies) never do.
+        Only a plain user session presented as the cookie, with no Bearer
+        header alongside it, qualifies: Bearer callers, delegated/machine
+        tokens (``grant_id`` / ``scope``) and WebSocket handshakes (which
+        cannot reliably set cookies) never do.
         """
         if not self.renews_browser_sessions:
             return
-        if not from_cookie or request.scope.get("type") != "http":
+        if not cookie_only or request.scope.get("type") != "http":
             return
         if payload.get("grant_id") is not None or payload.get("scope") is not None:
             return
@@ -905,29 +922,32 @@ class UnifiedAuthProvider(AuthProvider):
         )
         return token, max_age
 
-    def end_browser_session(self, request: HTTPConnection) -> None:
+    def end_browser_session(self, request: HTTPConnection) -> bool:
         """End the browser session whose cookie *request* carries (logout).
 
         Records the cookie's ``sid`` in the shared revocation store (and
         locally) until the session's absolute expiry, so neither it nor
         any renewal of it authenticates as a cookie again on any replica,
-        and evicts its cached entries. A store failure is logged, never
-        raised: the local record still holds and the logout response must
-        always clear the cookie. The signature is verified but an
-        expired cookie still counts: a request that authenticated just
-        before expiry may still be renewing it. A cookie without a ``sid``
-        (legacy) is never renewed, so clearing it is enough.
+        and evicts its cached entries. A store failure is logged, not
+        raised, so the logout response can still clear the cookie; the
+        local record still holds, and the caller reports the failure. The
+        signature is verified but an expired cookie still counts: a request
+        that authenticated just before expiry may still be renewing it. A
+        cookie without a ``sid`` (legacy) is never renewed, so clearing it
+        is enough.
 
         :param request: The logout request.
+        :returns: ``False`` only when the shared store could not record the
+            session; ``True`` when it did or there was nothing to record.
         """
         import jwt
 
         config = self._session_config()
         if config is None:
-            return
+            return True
         token = request.cookies.get(config.session_cookie_name)
         if not token:
-            return
+            return True
         try:
             payload = jwt.decode(
                 token,
@@ -936,16 +956,16 @@ class UnifiedAuthProvider(AuthProvider):
                 options={"verify_exp": False},
             )
         except jwt.InvalidTokenError:
-            return
+            return True
         sid = payload.get("sid")
         auth_time = payload.get("auth_time")
         user_id = payload.get("sub")
         if not isinstance(sid, str) or not isinstance(auth_time, int):
-            return
+            return True
         now = time.time()
         until = auth_time + config.session_max_lifetime_seconds
         if until <= now:
-            return
+            return True
         for ended_sid, ended_until in list(self._ended_sessions.items()):
             if ended_until <= now:
                 self._ended_sessions.pop(ended_sid, None)
@@ -953,16 +973,20 @@ class UnifiedAuthProvider(AuthProvider):
         for key, (_, _, cached_payload) in list(self._cookie_cache.items()):
             if cached_payload.get("sid") == sid:
                 self._cookie_cache.pop(key, None)
-        if self._session_revocations is not None:
-            try:
-                self._session_revocations.revoke(
-                    sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
-                )
-            except Exception:
-                logger.exception(
-                    "Could not record logout of a browser session in the shared store; "
-                    "other replicas may accept its cookie until it expires"
-                )
+        if self._session_revocations is None:
+            return True
+        try:
+            self._session_revocations.revoke(
+                sid, user_id=user_id if isinstance(user_id, str) else "", expires_at=until
+            )
+        except Exception:
+            logger.exception(
+                "Could not record logout of a browser session in the shared store; "
+                "other replicas, or this server after a restart, may accept its cookie "
+                "until the session's absolute expiry"
+            )
+            return False
+        return True
 
     def _check_header(self, request: HTTPConnection) -> str | None:
         """Read the trusted identity header and return the user ID.

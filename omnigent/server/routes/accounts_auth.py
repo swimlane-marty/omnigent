@@ -39,7 +39,12 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
-from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.auth import (
+    _RESERVED_USERS,
+    LOGOUT_NOT_RECORDED_MESSAGE,
+    RESERVED_USER_LOCAL,
+    UnifiedAuthProvider,
+)
 from omnigent.server.oidc import mint_session_cookie, set_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -364,10 +369,18 @@ def create_accounts_auth_router(
 
     @router.post("/logout")
     async def logout(request: Request) -> Response:
-        """End the browser session and clear its cookie. Always 204 (no body)."""
-        # Records the logout in the shared store; never raises.
-        await asyncio.to_thread(auth_provider.end_browser_session, request)
-        resp = Response(status_code=204)
+        """End the browser session and clear its cookie.
+
+        204 (no body) once the logout is recorded in the shared store. If
+        that write fails, 503 with an error body; the cookie is cleared
+        either way.
+        """
+        recorded = await asyncio.to_thread(auth_provider.end_browser_session, request)
+        resp = (
+            Response(status_code=204)
+            if recorded
+            else JSONResponse(status_code=503, content={"error": LOGOUT_NOT_RECORDED_MESSAGE})
+        )
         _clear_session_cookie(resp, cookie_name=_session_cookie, secure=_secure)
         return resp
 

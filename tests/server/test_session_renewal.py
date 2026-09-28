@@ -375,6 +375,23 @@ def test_bearer_request_is_never_renewed(probe: Any, source: str, origin: str) -
     assert resp.headers.get_list("set-cookie") == []
 
 
+@pytest.mark.parametrize(("source", "origin"), _MODES)
+def test_cookie_plus_bearer_request_is_never_renewed(probe: Any, source: str, origin: str) -> None:
+    """A request carrying both the cookie and a Bearer header never slides the cookie."""
+    client, provider = probe(source, origin)
+    name = _cookie_name(origin)
+    aged = _session_jwt(remaining=600)
+
+    resp = client.get(_PROBE, headers={**_cookie(name, aged), "Authorization": f"Bearer {aged}"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers.get_list("set-cookie") == []
+    marked = _Conn(cookies={name: aged})
+    marked.headers["Authorization"] = f"Bearer {aged}"
+    assert provider.get_user_id(marked) == _USER  # type: ignore[arg-type]
+    assert _SESSION_RENEWAL_KEY not in marked.scope
+
+
 @pytest.mark.parametrize(
     "delegation",
     [
@@ -660,7 +677,8 @@ def test_browser_logout_leaves_bearer_copy_valid(probe: Any) -> None:
 
 def test_cache_entry_never_outlives_token_exp() -> None:
     """A cached identity expires no later than the token itself."""
-    provider = _provider("oidc", _HTTP)
+    # Renewal off: a due token would be evicted as superseded, not cached.
+    provider = _provider("oidc", _HTTP, durable=False)
     token = _session_jwt(remaining=120)
 
     assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
@@ -686,21 +704,52 @@ def test_renewed_token_gets_its_own_validated_cache_entry(probe: Any) -> None:
     assert user == _USER
     assert claims["exp"] == _decode(renewed)["exp"]
     assert deadline - time.monotonic() <= _TTL + 1
-    old_claims = provider._cookie_cache[hmac_digest(old, _SECRET)][2]
-    assert old_claims["exp"] < claims["exp"]
+    # The superseded token was evicted when its renewal was staged.
+    assert hmac_digest(old, _SECRET) not in provider._cookie_cache
+
+
+def test_staged_renewal_evicts_superseded_and_expired_entries() -> None:
+    """Staging a renewal drops the replaced token's entry and every expired one."""
+    provider = _provider("oidc", _HTTP)
+    fresh = _session_jwt(remaining=_TTL - 10, sid="sid-other")
+    assert provider.get_user_id(_Conn(cookies={"ap_session": fresh})) == _USER  # type: ignore[arg-type]
+    provider._cookie_cache["stale"] = (_USER, time.monotonic() - 1, {})
+    aged = _session_jwt(remaining=600)
+    conn = _Conn(cookies={"ap_session": aged})
+
+    assert provider.get_user_id(conn) == _USER  # type: ignore[arg-type]
+
+    assert _SESSION_RENEWAL_KEY in conn.scope
+    assert hmac_digest(aged, _SECRET) not in provider._cookie_cache
+    assert "stale" not in provider._cookie_cache
+    assert hmac_digest(fresh, _SECRET) in provider._cookie_cache
 
 
 def test_cache_hit_still_offers_renewal(probe: Any) -> None:
-    """An aged cookie served from the cache is still renewed."""
+    """A cookie that became due while cached is renewed from the cache hit."""
     client, provider = probe("oidc", _HTTP)
     name = _cookie_name(_HTTP)
-    old = _session_jwt(remaining=600)
-    client.get(_PROBE, headers=_cookie(name, old))
-    assert hmac_digest(old, _SECRET) in provider._cookie_cache
+    token = _session_jwt(remaining=600)
+    key = hmac_digest(token, _SECRET)
+    provider._cookie_cache[key] = (_USER, time.monotonic() + 600, _decode(token))
 
-    resp = client.get(_PROBE, headers=_cookie(name, old))
+    resp = client.get(_PROBE, headers=_cookie(name, token))
 
     assert len(_session_set_cookies(resp, name)) == 1
+    assert key not in provider._cookie_cache
+
+
+def test_aged_cookie_keeps_renewing_until_replaced(probe: Any) -> None:
+    """A browser still sending the old cookie gets a renewal on each request."""
+    client, _ = probe("oidc", _HTTP)
+    name = _cookie_name(_HTTP)
+    old = _session_jwt(remaining=600)
+
+    first = client.get(_PROBE, headers=_cookie(name, old))
+    second = client.get(_PROBE, headers=_cookie(name, old))
+
+    assert len(_session_set_cookies(first, name)) == 1
+    assert len(_session_set_cookies(second, name)) == 1
 
 
 def test_expired_cache_entries_are_pruned() -> None:
@@ -716,9 +765,10 @@ def test_expired_cache_entries_are_pruned() -> None:
 def test_logout_evicts_cached_entries_of_the_session() -> None:
     """Logout drops every cached token of the session; none is served again."""
     provider = _provider("oidc", _HTTP)
-    first = _session_jwt(remaining=600)
+    # Not yet due for renewal, so all three stay cached until logout.
+    first = _session_jwt(remaining=_TTL - 600)
     second = _session_jwt(remaining=_TTL - 10)
-    other = _session_jwt(remaining=600, sid="sid-other")
+    other = _session_jwt(remaining=_TTL - 600, sid="sid-other")
     for token in (first, second, other):
         assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
 
@@ -734,12 +784,23 @@ def test_logout_evicts_cached_entries_of_the_session() -> None:
 # ── Contract 8: configuration ────────────────────────────────────
 
 
-def test_login_cookie_stamps_auth_time_and_fresh_sid() -> None:
-    """Every login mints its own session id, with auth_time = iat."""
-    first = _decode(mint_session_cookie(_USER, _SECRET, _TTL_HOURS, "accounts"))
-    second = _decode(mint_session_cookie(_USER, _SECRET, _TTL_HOURS, "accounts"))
+def test_login_cookie_stamps_auth_time_and_fresh_sid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every login mints its own session id, with auth_time = iat exactly.
+
+    The clock crosses a second boundary on every read, so a second read
+    while minting would split auth_time from iat.
+    """
+    _Clock(monkeypatch, tick=1)
+
+    def mint() -> dict[str, Any]:
+        token = mint_session_cookie(_USER, _SECRET, _TTL_HOURS, "accounts")
+        # The fake clock runs ahead of the real one; only the claim values matter.
+        return jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_iat": False})
+
+    first, second = mint(), mint()
 
     assert first["auth_time"] == first["iat"]
+    assert first["exp"] == first["iat"] + _TTL
     assert isinstance(first["sid"], str) and first["sid"]
     assert first["sid"] != second["sid"]
 
@@ -1047,11 +1108,12 @@ def test_cache_hit_past_wall_clock_exp_is_rejected(monkeypatch: pytest.MonkeyPat
     """
     provider = _provider("oidc", _HTTP)
     clock = _Clock(monkeypatch)
-    token = _session_jwt(remaining=30)
+    # Not yet due for renewal when cached, so it stays in the cache.
+    token = _session_jwt(remaining=_TTL // 2 + 30)
     assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
     key = hmac_digest(token, _SECRET)
 
-    clock.advance(45)
+    clock.advance(_TTL // 2 + 45)
     late = _Conn(cookies={"ap_session": token})
 
     assert provider._cookie_cache[key][1] > time.monotonic()
@@ -1078,14 +1140,11 @@ def test_capped_renewal_exp_is_exact_when_the_clock_ticks(
 
 
 @pytest.mark.parametrize("source", ["accounts", "oidc"])
-def test_logout_on_one_replica_ends_the_session_on_others(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch, source: str
-) -> None:
+def test_logout_on_one_replica_ends_the_session_on_others(db_uri: str, source: str) -> None:
     """Replicas sharing a database honour each other's logouts, and so does a restart.
 
-    Accounts mode checks every request. An OIDC replica that already cached
-    the cookie may accept it until the cache recheck window ends, but never
-    renews it.
+    Replica B has already validated (and, in OIDC mode, cached) the cookie;
+    a logout on replica A must still be refused on B's very next request.
     """
 
     def replica() -> UnifiedAuthProvider:
@@ -1105,14 +1164,8 @@ def test_logout_on_one_replica_ends_the_session_on_others(
         replica_a.end_browser_session(_Conn(cookies={name: aged}))  # type: ignore[arg-type]
 
         resp = client_b.get(_PROBE, headers=headers)
+        assert resp.status_code == 401
         assert _session_set_cookies(resp, name) == []
-        if source == "accounts":
-            assert resp.status_code == 401
-        else:
-            assert resp.status_code == 200  # cached, inside the recheck window
-            real_monotonic = time.monotonic
-            monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 61)
-            assert client_b.get(_PROBE, headers=headers).status_code == 401
 
     restarted = replica()
     assert restarted.get_user_id(_Conn(cookies={name: aged})) is None  # type: ignore[arg-type]
@@ -1166,8 +1219,9 @@ def test_logout_store_failure_is_logged_and_session_still_ended_locally(
     token = _session_jwt(remaining=600)
 
     with caplog.at_level("ERROR", logger="omnigent.server.auth"):
-        provider.end_browser_session(_Conn(cookies={"ap_session": token}))  # type: ignore[arg-type]
+        recorded = provider.end_browser_session(_Conn(cookies={"ap_session": token}))  # type: ignore[arg-type]
 
+    assert recorded is False
     assert failing.write_on_event_loop == [False]
     assert "sid-abc" in provider._ended_sessions
     assert any("Could not record logout" in r.getMessage() for r in caplog.records)
@@ -1178,7 +1232,10 @@ def test_logout_store_failure_is_logged_and_session_still_ended_locally(
 def test_oidc_logout_clears_cookie_when_store_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str
 ) -> None:
-    """OIDC logout writes off the event loop and always clears the cookie."""
+    """OIDC logout clears the cookie but reports a failed write as 503.
+
+    No redirect (so no IdP end-session hop): the browser shows the error.
+    """
     client, provider = _oidc_client(monkeypatch, tmp_path, origin)
     failing = _FailingRevocations()
     provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, failing))
@@ -1187,7 +1244,9 @@ def test_oidc_logout_clears_cookie_when_store_fails(
     with client:
         logout = client.get("/auth/logout", headers=_cookie(name, aged), follow_redirects=False)
 
-        assert logout.status_code == 302
+        assert logout.status_code == 503
+        assert "location" not in logout.headers
+        assert "could not record the sign-out" in logout.text
         assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
         assert failing.write_on_event_loop == [False]
         after = client.get(_PROBE, headers=_cookie(name, aged))
@@ -1198,7 +1257,7 @@ def test_oidc_logout_clears_cookie_when_store_fails(
 def test_accounts_logout_clears_cookie_when_store_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Accounts logout writes off the event loop and always clears the cookie."""
+    """Accounts logout clears the cookie but reports a failed write as 503."""
     calls: list[bool] = []
 
     def failing_revoke(self: object, sid: str, *, user_id: str, expires_at: int) -> None:
@@ -1213,7 +1272,40 @@ def test_accounts_logout_clears_cookie_when_store_fails(
 
         logout = client.post("/auth/logout", headers=_cookie(name, token))
 
-        assert logout.status_code == 204
+        assert logout.status_code == 503
+        assert "could not record the sign-out" in logout.json()["error"]
         assert _parse_set_cookie(_session_set_cookies(logout, name)[0])[2]["max-age"] == "0"
         assert calls == [False]
         assert client.get("/auth/me", headers=_cookie(name, token)).status_code == 401
+
+
+# ── Review round 3 regressions ───────────────────────────────────
+
+
+class _CountingRevocations(_MemoryRevocations):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookups = 0
+
+    def is_revoked(self, sid: str) -> bool:
+        self.lookups += 1
+        return super().is_revoked(sid)
+
+
+def test_cached_cookie_costs_one_revocation_lookup_and_no_bearer_lookup() -> None:
+    """A cache hit on a cookie session does one store lookup; a Bearer hit does none."""
+    provider = _provider("oidc", _HTTP, durable=False)
+    counting = _CountingRevocations()
+    provider.set_session_revocation_store(cast(BrowserSessionRevocationStore, counting))
+    token = _session_jwt(remaining=_TTL - 10)
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
+    assert hmac_digest(token, _SECRET) in provider._cookie_cache
+    counting.lookups = 0
+
+    assert provider.get_user_id(_Conn(cookies={"ap_session": token})) == _USER  # type: ignore[arg-type]
+    assert counting.lookups == 1
+
+    bearer = _Conn(cookies={})
+    bearer.headers["Authorization"] = f"Bearer {token}"
+    assert provider.get_user_id(bearer) == _USER  # type: ignore[arg-type]
+    assert counting.lookups == 1

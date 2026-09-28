@@ -131,14 +131,17 @@ def mint_session_cookie(
         or ``"github"``. Stored as an informational claim.
     :returns: An HS256-signed JWT string.
     """
+    # One clock reading, so ``auth_time`` equals ``iat`` exactly at login.
+    now = int(time.time())
     return mint_session_token(
         user_id,
         cookie_secret,
         ttl_hours * 3600,
         provider,
         account_generation=account_generation,
-        auth_time=int(time.time()),
+        auth_time=now,
         session_id=secrets.token_urlsafe(16),
+        issued_at=now,
     )
 
 
