@@ -826,7 +826,8 @@ def create_device_auth_router(
         so any mismatch is visible before approval.
 
         **Re-authentication:** consent requires a login performed AFTER this
-        device flow began (session login time ≥ the grant's ``created_at``). A
+        device flow began (the session's ``auth_time``, its original login
+        time, ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
         costs a deliberate, fresh password entry. This closes the
@@ -854,7 +855,7 @@ def create_device_auth_router(
             )
 
         # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (login time ≥ the grant's created_at)
+        # only a login started for THIS flow (auth_time ≥ the grant's created_at)
         # may approve. Bounce with reauth=1 so the login page re-prompts
         # rather than auto-returning the stale session (which would loop).
         session_login_time = _session_login_time(request)
@@ -896,7 +897,7 @@ def create_device_auth_router(
 
         # Re-auth gate, enforced here too (not just on the consent GET): a
         # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session login time ≥ the grant's created_at) passes.
+        # started for THIS flow (session auth_time ≥ the grant's created_at) passes.
         session_login_time = _session_login_time(request)
         if session_login_time is None or session_login_time < grant.created_at:
             return HTMLResponse(

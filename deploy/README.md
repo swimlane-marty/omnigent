@@ -430,7 +430,7 @@ signs in again at most once per max lifetime.
 
 | Variable (accounts / OIDC) | Default | Meaning |
 |---|---|---|
-| `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle window: an unused session expires after this long. |
+| `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` / `OMNIGENT_OIDC_SESSION_TTL_HOURS` | `8` | Idle window. Renewal only happens past its halfway point, so an unused session expires between half of this and all of it after its last request. |
 | `OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS` / `OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS` | `720` (30 days) | Absolute limit from login. Must be at least the idle window. Set it equal to the idle window to turn renewal off. |
 
 Renewal relies on the server's database to record sign-outs, and every deploy
@@ -441,11 +441,9 @@ the fixed expiry set at login, as before renewal existed.
 
 Signing out ends the session and every renewed cookie descended from it. The
 logout is recorded in the server's database until the session's max lifetime,
-so it holds on every replica sharing that database and survives restarts. In
-accounts mode another replica rejects the cookie on its next request. In OIDC
-mode a replica that validated the cookie within the last minute may keep
-accepting it for up to a minute more, but no replica will renew it. Sign-out
-ends only the browser cookie. A CLI holding the same token as a Bearer (the OIDC
+so it holds on every replica sharing that database and survives restarts:
+every replica rejects the cookie on its next request. Sign-out ends only the
+browser cookie. A CLI holding the same token as a Bearer (the OIDC
 `omnigent login` browser flow hands one token to both) keeps it until it
 expires on its own.
 
@@ -455,6 +453,24 @@ on schedule, and the next login issues one that renews. CLI and host tokens
 IdP is only consulted at login, so the max lifetime is also how long an active
 browser keeps access after a user is removed at the IdP. Lower it to match your
 deprovisioning policy.
+
+If the database write fails, sign-out still clears the cookie in that browser
+and ends the session on the server that handled it, but answers `503` instead
+of succeeding (OIDC shows an error page rather than redirecting, so the IdP
+end-session hop is skipped). Until the session's max lifetime, a copy of that
+cookie may still be accepted by other replicas, or by the same server after a
+restart. The server logs each failure.
+
+**Rolling back.** Sign-outs are recorded in the `browser_session_revocations`
+table, which the database migration creates. Downgrading that migration drops
+the table, and an older server ignores it, so a rollback while renewed cookies
+are still valid can re-admit sessions that were signed out. When rolling back,
+rotate the session cookie secret (`OMNIGENT_ACCOUNTS_COOKIE_SECRET` or
+`OMNIGENT_OIDC_COOKIE_SECRET`) as part of the rollback, which signs every
+browser out, or wait to roll back until the max lifetime has passed since the
+last sign-out that must keep holding. Rotating the secret also invalidates CLI
+and host tokens and refresh grants signed with it, so those need
+`omnigent login` again.
 
 ### Browser origin allowlist
 
