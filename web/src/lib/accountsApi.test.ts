@@ -40,3 +40,41 @@ describe("accountsApi base path", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/proxy/6767/auth/me");
   });
 });
+
+describe("logout", () => {
+  it("resolves when the server signs the session out", async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 204 } as unknown as Response);
+
+    await expect(logout()).resolves.toBeUndefined();
+
+    expect(fetchMock.mock.calls[0][1]).toEqual({ method: "POST" });
+  });
+
+  it("throws the server's error when sign-out could not be recorded (503)", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: "Sign-out failed: you are still signed in." }),
+    } as unknown as Response);
+
+    await expect(logout()).rejects.toThrow("Sign-out failed: you are still signed in.");
+  });
+
+  it("throws a generic error when a 503 body is not JSON", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => {
+        throw new SyntaxError("not json");
+      },
+    } as unknown as Response);
+
+    await expect(logout()).rejects.toThrow(/still signed in/);
+  });
+
+  it("throws when the server cannot be reached", async () => {
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    await expect(logout()).rejects.toThrow(/Could not reach the server/);
+  });
+});
