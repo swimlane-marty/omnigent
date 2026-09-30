@@ -39,6 +39,14 @@ and steers messages while the agent is busy.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `mobile-labels`: on narrow screens labels collapse to icons without
   overlapping the stop button.
+- `live-markdown`: Markdown in the draft is styled as it is typed, glyph for
+  glyph over the textarea, with markers hidden until the caret edits them; the
+  sent text is exactly what was typed. States: code blocks, quotes, reply-quote
+  blocks, right-to-left text, long drafts.
+- `markdown-typing-aids`: typed `*`, `_` and backticks get their closers, stray
+  spaces inside emphasis tidy, and ``` makes a code block; each is one undo.
+- `compact-preview`: once the composer loses focus, hidden markers take no
+  space and code fences collapse; a click puts the caret on the character.
 
 ## How to get to it (user POV)
 
@@ -72,6 +80,10 @@ and steers messages while the agent is busy.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
+
+**Live Markdown** (either composer, and the side chat): type `**bold**`,
+`_italic_`, `` `code` ``, ``` for a block, or `> ` for a quote; click away to
+see the compact preview, then click a word in it to edit there.
 
 ## Driving it with the repro environment
 
@@ -141,6 +153,16 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`mobile-labels`, new-session composer:**
   `tests/e2e_ui/mobile/test_composer_model_label_stop_overlap.py::test_new_session_composer_collapses_labels_to_icons_on_mobile`
+- **`live-markdown`:**
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_session_composer_styles_markdown_and_sends_it_unchanged`,
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_highlight_layer_stays_aligned_while_wrapping_and_scrolling`,
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_landing_and_side_chat_composers_style_markdown`
+- **`markdown-typing-aids`:**
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_auto_paired_markers_show_and_send_real_text`,
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_typing_code_blocks_and_tidying_emphasis`
+- **`compact-preview`:**
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_compact_preview_closes_marker_gaps_and_clicks_place_the_caret`,
+  `tests/e2e_ui/composer/test_composer_live_markdown.py::test_compact_preview_first_tap_focuses_with_the_caret_there`
 
 ## Gotchas
 
@@ -157,3 +179,6 @@ Tests under `tests/browser_ui/` stub every backend call and need no instance:
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- Live Markdown has two views: the aligned layer while focused and the compact
+  preview when not. Check a change in both, and type it key by key: `fill()`
+  skips the typing aids.
